@@ -1,0 +1,76 @@
+[workspace]
+# phinet-browser is NOT listed here — it is a Tauri app with its own
+# build pipeline. Build it with:
+#   cd phinet-browser && npm install && cargo tauri build
+#
+# Build the daemon + CLI with:
+#   cargo build --release
+members = [
+    "phinet-core",
+    "phinet-daemon",
+    "phinet-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version    = "0.1.0"
+edition    = "2021"
+authors    = ["ΦNET Contributors"]
+license    = "MIT"
+repository = "https://github.com/phinet/phinet"
+
+[workspace.dependencies]
+# Async runtime
+tokio          = { version = "1",   features = ["full"] }
+tokio-util     = { version = "0.7", features = ["codec"] }
+
+# Crypto
+x25519-dalek      = { version = "2",    features = ["static_secrets"] }
+chacha20poly1305  = "0.10"
+sha2              = "0.10"
+blake2            = "0.10"
+hkdf              = "0.12"
+rand              = "0.8"
+rand_core         = "0.6"
+zeroize           = "1"
+
+# Post-quantum (ML-KEM-1024 hybrid)
+ml-kem            = "0.2.3"
+hybrid-array      = "=0.2.0-rc.9"
+
+# Serialization
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Networking
+bytes = "1"
+
+# Math / big integers (v2 certs)
+num-bigint  = { version = "0.4", features = ["rand"] }
+num-traits  = "0.2"
+num-integer = "0.1"
+num-prime   = "0.4"
+
+# Argon2id (memory-hard PoW)
+argon2 = "0.5"
+
+# Utilities
+hex    = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+dirs   = "5"
+
+# Logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "1"
+anyhow    = "1"
+
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
+panic         = "abort"
+strip         = true
+
