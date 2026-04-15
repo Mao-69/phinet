@@ -1,0 +1,33 @@
+[package]
+name        = "phinet-browser"
+description = "ΦNET Browser -- PHINET anonymous browser (Tauri + React)"
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["PHINET Contributors"]
+license     = "MIT"
+
+# Empty [workspace] stops Cargo scanning up to the parent workspace.
+# Tauri's own build pipeline manages this crate independently.
+[workspace]
+
+[[bin]]
+name = "phinet-browser"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+phinet-core          = { path = "../../phinet-core" }
+tauri                = { version = "2", features = [] }
+tauri-plugin-shell   = "2"
+tauri-plugin-dialog  = "2"
+tokio                = { version = "1", features = ["full"] }
+serde                = { version = "1", features = ["derive"] }
+serde_json           = "1"
+anyhow               = "1"
+dirs                 = "5"
+hex                  = "0.4"
+tracing              = "0.1"
+tracing-subscriber   = { version = "0.3", features = ["env-filter"] }
+rand                 = "0.8"
