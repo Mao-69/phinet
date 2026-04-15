@@ -3,6 +3,12 @@
 A Tor-inspired network rooted in number theory. Identity = a valid ΦNET
 certificate (untouchable × totient × prime). No accounts, no IP identity, no trust.
 
+<img width="1059" height="687" alt="01" src="https://github.com/user-attachments/assets/12ae45da-9ac1-49c8-bd33-bc61366b3e7d" />
+
+<img width="1059" height="687" alt="02" src="https://github.com/user-attachments/assets/64537e4a-27f1-4e7b-a0ab-c192fc060282" />
+
+<img width="1059" height="687" alt="03" src="https://github.com/user-attachments/assets/efdbf237-748b-41cc-9d2c-42e7902a8ea2" />
+
 ## Architecture
 
 ```
