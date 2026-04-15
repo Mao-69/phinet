@@ -1,6 +1,6 @@
-# ΦNET — Anonymous Overlay Network
+# ΦNET — Overlay Network
 
-A Tor-inspired anonymous network rooted in number theory. Identity = a valid ΦNET
+A Tor-inspired network rooted in number theory. Identity = a valid ΦNET
 certificate (untouchable × totient × prime). No accounts, no IP identity, no trust.
 
 ## Architecture
@@ -24,6 +24,7 @@ cargo build --release
 # Browser only
 cd phinet-browser
 npm install
+npm run build
 cargo tauri build
 ```
 
