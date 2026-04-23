@@ -45,6 +45,18 @@ fn load_or_create(bits: CertBits, reset: bool) -> Result<PhiCert> {
     let cert  = PhiCert::generate(bits).context("cert generation failed")?;
     let saved = serde_json::to_string_pretty(&SavedIdentity { cert: cert.to_wire() })?;
     std::fs::write(&path, saved)?;
+
+    // Restrict permissions so only the owner can read/write. This is
+    // defense in depth: even though the file currently only holds
+    // public cert material, if we later add private-key storage here
+    // the file permissions already protect it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path,
+            std::fs::Permissions::from_mode(0o600));
+    }
+
     info!("Identity saved to {}", path.display());
     Ok(cert)
 }
@@ -171,7 +183,7 @@ async fn dispatch(req: &Req, node: &Arc<PhiNode>) -> Resp {
             let name = req.name.as_deref().unwrap_or("").to_string();
             let hs   = node.register_hs(&name).await;
             let desc = hs.descriptor(Some(&detect_ip()), Some(node.port + 1));
-            node.broadcast_hs(desc).await;
+            node.broadcast_hs(desc, &hs.identity).await;
             Resp::ok(serde_json::json!({
                 "hs_id":     hs.hs_id,
                 "name":      hs.name,
@@ -215,6 +227,84 @@ async fn dispatch(req: &Req, node: &Arc<PhiNode>) -> Resp {
                     node.bootstrap(vec![(host, port)]).await;
                 });
                 Resp::ok(serde_json::json!({ "connecting": true }))
+            }
+        }
+
+        "circuit_status" => {
+            let (origins, relays) = node.circuit_status().await;
+            Resp::ok(serde_json::json!({
+                "origins": origins,
+                "relays":  relays,
+            }))
+        }
+
+        "build_circuit" => {
+            // Path is a comma-separated list of "node_id_hex@host:port"
+            // Example: {"cmd":"build_circuit","path":"ab..@1.2.3.4:7700,cd..@5.6.7.8:7700"}
+            let path_str = req.text.as_deref().unwrap_or("").trim();
+            if path_str.is_empty() {
+                return Resp::err("missing 'text' field with comma-separated path");
+            }
+
+            let mut path = Vec::new();
+            for entry in path_str.split(',') {
+                let entry = entry.trim();
+                let Some((id_hex, addr)) = entry.split_once('@') else {
+                    return Resp::err(&format!("malformed hop: {entry} (want id@host:port)"));
+                };
+                let Ok(id_vec) = hex::decode(id_hex) else {
+                    return Resp::err(&format!("bad hex in node_id: {id_hex}"));
+                };
+                if id_vec.len() != 32 {
+                    return Resp::err(&format!("node_id must be 32 bytes, got {}", id_vec.len()));
+                }
+                let Some((host, port_str)) = addr.rsplit_once(':') else {
+                    return Resp::err(&format!("malformed addr: {addr}"));
+                };
+                let Ok(port) = port_str.parse::<u16>() else {
+                    return Resp::err(&format!("bad port: {port_str}"));
+                };
+                let mut id = [0u8; 32];
+                id.copy_from_slice(&id_vec);
+
+                // Look up the peer's x25519 static public key from the
+                // node's peer table. Without it, the ntor handshake
+                // can't be addressed to this hop, so the circuit-build
+                // would time out. The hop must already be a connected
+                // peer for this to work.
+                let static_pub: [u8; 32] = {
+                    let peers = node.peers_snapshot().await;
+                    let Some(peer) = peers.iter().find(|p| p.node_id == id) else {
+                        return Resp::err(&format!(
+                            "hop {} not a connected peer — phi peer connect first",
+                            hex::encode(&id[..6])
+                        ));
+                    };
+                    match hex::decode(&peer.static_pub)
+                        .ok()
+                        .and_then(|v| v.try_into().ok())
+                    {
+                        Some(b) => b,
+                        None => return Resp::err(
+                            "peer's static_pub is corrupted in peer table"),
+                    }
+                };
+
+                path.push(phinet_core::circuit::LinkSpec {
+                    host:       host.to_string(),
+                    port,
+                    node_id:    id,
+                    static_pub,
+                });
+            }
+
+            let node = Arc::clone(node);
+            match node.build_circuit(path).await {
+                Ok(cid) => Resp::ok(serde_json::json!({
+                    "circ_id": cid.0,
+                    "hops":    path_str.split(',').count(),
+                })),
+                Err(e) => Resp::err(&format!("build_circuit: {e}")),
             }
         }
 
@@ -315,7 +405,55 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Wire SIGINT/SIGTERM to a graceful shutdown. Without this the
+    // daemon can only be stopped with SIGKILL, which drops in-flight
+    // state (replay-cache writes, guard persistence, board flushes).
+    // With this wiring, Ctrl-C / systemd stop triggers the same
+    // idempotent shutdown path that integration tests use, giving
+    // background loops a chance to finish cleanly.
+    {
+        let sn = Arc::clone(&node);
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                // Set up both handlers; race them against each other
+                // so whichever fires first triggers shutdown.
+                let mut sigint  = match signal(SignalKind::interrupt()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("signal handler setup failed: {e}");
+                        return;
+                    }
+                };
+                let mut sigterm = match signal(SignalKind::terminate()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("signal handler setup failed: {e}");
+                        return;
+                    }
+                };
+                tokio::select! {
+                    _ = sigint.recv()  => tracing::info!("SIGINT received"),
+                    _ = sigterm.recv() => tracing::info!("SIGTERM received"),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                // Windows: just ctrl_c. SIGTERM isn't a Windows concept.
+                if let Err(e) = tokio::signal::ctrl_c().await {
+                    tracing::warn!("ctrl_c handler: {e}");
+                    return;
+                }
+                tracing::info!("ctrl_c received");
+            }
+            tracing::info!("shutting down gracefully…");
+            sn.shutdown();
+        });
+    }
+
     node.run().await?;
+    tracing::info!("daemon exited cleanly");
     Ok(())
 }
 
