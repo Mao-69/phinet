@@ -43,6 +43,29 @@ impl Session {
         let n = self.recv_nonce.fetch_add(1, Ordering::SeqCst);
         aead_decrypt(&self.recv_key, n, b"", ciphertext)
     }
+
+    /// Derive a key for proving cert-rotation authenticity. Keyed by
+    /// the session's own send_key but domain-separated so the raw
+    /// AEAD key is never exposed and this key is unique per-direction.
+    /// Both peers derive the same value from their (send_key, recv_key)
+    /// pair because the derivation mixes both ends.
+    pub fn rotation_link_key(&self) -> [u8; 32] {
+        let mut material = Vec::with_capacity(64);
+        // Always use the smaller key first so both sides agree.
+        let a: &[u8] = self.send_key.as_ref();
+        let b: &[u8] = self.recv_key.as_ref();
+        if a < b {
+            material.extend_from_slice(a);
+            material.extend_from_slice(b);
+        } else {
+            material.extend_from_slice(b);
+            material.extend_from_slice(a);
+        }
+        let out = hkdf_derive(&material, b"phinet-cert-rotate-v1", b"link", 32);
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&out);
+        k
+    }
 }
 
 // ── Ephemeral keypair ─────────────────────────────────────────────────

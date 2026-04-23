@@ -65,6 +65,15 @@ impl KBucket {
     fn all(&self) -> Vec<PeerInfo> {
         self.nodes.iter().cloned().collect()
     }
+
+    fn remove(&mut self, id: &[u8; 32]) -> bool {
+        if let Some(pos) = self.nodes.iter().position(|p| p.node_id == *id) {
+            self.nodes.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 // ── Routing table ─────────────────────────────────────────────────────
@@ -96,6 +105,12 @@ impl RoutingTable {
         if peer.node_id == self.own_id { return; }
         let idx = self.bucket_idx(&peer.node_id);
         self.buckets[idx].write().unwrap().add(peer);
+    }
+
+    pub fn remove_peer(&self, id: &[u8; 32]) -> bool {
+        if *id == self.own_id { return false; }
+        let idx = self.bucket_idx(id);
+        self.buckets[idx].write().unwrap().remove(id)
     }
 
     pub fn closest(&self, target: &[u8; 32], k: usize) -> Vec<PeerInfo> {
@@ -214,6 +229,10 @@ mod tests {
             intro_pub: "deadbeef".into(),
             intro_host: Some("1.2.3.4".into()),
             intro_port: Some(8080),
+            identity_pub: String::new(),
+            epoch: 0,
+            sig: String::new(),
+            blinded_pub: String::new(),
         };
         s.put_hs(&d);
         let got = s.get_hs("ab12345678901234abcd").unwrap();

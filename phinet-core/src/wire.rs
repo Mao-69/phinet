@@ -87,6 +87,7 @@ pub enum Message {
     HandshakeAck(HandshakeAck),
     Reject(Reject),
     Onion(Onion),
+    CircuitCell(CircuitCellMsg),
     DhtFind(DhtFind),
     DhtFound(DhtFound),
     DhtStore(DhtStore),
@@ -101,6 +102,7 @@ pub enum Message {
     BoardFetch(BoardFetch),
     BoardPosts(BoardPosts),
     Padding(Padding),
+    CertRotate(CertRotate),
 }
 
 // ── Handshake ─────────────────────────────────────────────────────────
@@ -148,6 +150,13 @@ pub struct Onion {
     pub cell: String, // hex-encoded layered ciphertext
 }
 
+/// Real circuit cell: 512 bytes hex-encoded. Used for the production
+/// circuit protocol (CREATE / CREATED / RELAY / RELAY_EARLY / DESTROY).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitCellMsg {
+    pub data: String,
+}
+
 // ── DHT ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,6 +202,30 @@ pub struct DhtValue {
 
 // ── Hidden service ────────────────────────────────────────────────────
 
+/// A hidden-service descriptor published to the DHT. Clients fetch
+/// this by `hs_id` to learn where to send INTRODUCE1 cells.
+///
+/// # Authenticity
+///
+/// The descriptor is signed by the HS's long-term Ed25519 identity
+/// key. The `hs_id` is derived deterministically from that identity
+/// key (see `hs_identity::HsIdentity::hs_id`), so a client who learns
+/// the `hs_id` out-of-band (e.g. from a link the HS operator shares)
+/// can verify that the fetched descriptor really originated from the
+/// HS with that ID — an HSDir that tried to substitute a forged
+/// descriptor would need to also produce a valid signature under the
+/// identity key matching `hs_id`, which it cannot.
+///
+/// # Epoch blinding
+///
+/// To prevent HSDirs from correlating descriptors across time (and
+/// thus from mapping long-term identities to observed queries), real
+/// descriptor publication uses an epoch-specific **blinded** signing
+/// key derived from the identity key plus the current epoch. Clients
+/// blind the `hs_id` the same way to request the right copy. The
+/// `identity_pub` field here is the long-term key; the `sig` is made
+/// under the blinded subkey for `epoch`. See `hs_identity.rs` for the
+/// derivation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HsDescriptor {
     pub hs_id:      String,
@@ -200,6 +233,25 @@ pub struct HsDescriptor {
     pub intro_pub:  String,
     pub intro_host: Option<String>,
     pub intro_port: Option<u16>,
+    /// HS long-term Ed25519 public key, hex-encoded. The `hs_id`
+    /// must equal the derived ID of this key.
+    #[serde(default)]
+    pub identity_pub: String,
+    /// Publication epoch (monotonic, ~daily granularity). Signatures
+    /// are valid only for descriptors fetched within the same epoch.
+    #[serde(default)]
+    pub epoch: u64,
+    /// Ed25519 signature under the blinded key for this epoch, over
+    /// the canonical descriptor bytes (all fields above except sig).
+    /// Hex-encoded 64 bytes.
+    #[serde(default)]
+    pub sig: String,
+    /// Blinded Ed25519 public key used to verify `sig`. Clients
+    /// check the signature against this key. The binding between
+    /// `blinded_pub` and (`identity_pub`, `epoch`) depends on the
+    /// blinding scheme — see hs_identity.rs. Hex-encoded 32 bytes.
+    #[serde(default)]
+    pub blinded_pub: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,4 +324,33 @@ pub struct BoardPosts {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Padding {
     pub data: String, // hex-encoded random bytes
+}
+
+/// Announced when a node rotates its cert. The new cert identifies a
+/// fresh node_id; continuity with the old identity is proven by
+/// `link_sig`, an HMAC keyed by a secret derived from the old cert's
+/// connection-session key. A receiving peer who already had an open
+/// session with the old node_id verifies link_sig before replacing
+/// its routing-table entry, so an attacker cannot hijack a peer by
+/// broadcasting a forged CertRotate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CertRotate {
+    /// Previous node_id, hex-encoded. Receiver uses this to look up
+    /// which session's HMAC-salt to verify `link_sig` against.
+    pub old_node_id: String,
+    /// New node_id, hex-encoded. Derived from the new cert.
+    pub new_node_id: String,
+    /// The new cert's public fields in JSON (serialized `PhiCert`).
+    /// Receiver verifies the math before trusting anything else.
+    pub new_cert_json: String,
+    /// Monotonic sequence number. Must strictly increase per old_node_id
+    /// to prevent replay of an older rotation announcement.
+    pub seq: u64,
+    /// Unix timestamp of rotation (sanity only, not security-critical).
+    pub ts: u64,
+    /// Hex-encoded 32-byte HMAC-SHA256 over
+    ///   (old_node_id || new_node_id || new_cert_json || seq || ts)
+    /// keyed by a value derived from the session key shared with the
+    /// peer. See node.rs `build_cert_rotate` / `verify_cert_rotate`.
+    pub link_sig: String,
 }
