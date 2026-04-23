@@ -86,7 +86,7 @@ h1{font-size:2rem;font-weight:500;letter-spacing:.1em;color:#5a9cee;margin-botto
   </svg>
 </div>
 <h1>PHINET BROWSER</h1>
-<p class="tagline">UTPC CERTS · ONION-ROUTED · OVERLAY NETWORK</p>
+<p class="tagline">ANONYMOUS · ONION-ROUTED · DECENTRALIZED</p>
 <div class="search-box">
   <input id="addr" type="text" placeholder="Enter .phinet address (40 hex chars)"
     autocomplete="off" spellcheck="false">
@@ -103,7 +103,8 @@ h1{font-size:2rem;font-weight:500;letter-spacing:.1em;color:#5a9cee;margin-botto
 </div>
 <p class="status">${dot} ${text}</p>
 <p class="notice">
-  ΦNET Hidden Services is still early-stage.
+  Hidden services are not indexed anywhere.<br>
+  Share addresses out-of-band — discoverability breaks anonymity.
 </p>
 <script>
 document.getElementById('addr').addEventListener('keydown', e => { if (e.key === 'Enter') go(); });
