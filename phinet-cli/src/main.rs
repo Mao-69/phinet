@@ -88,64 +88,20 @@ async fn cmd_new(args: &[String]) -> Result<()> {
 }
 
 async fn cmd_init(args: &[String]) -> Result<()> {
-    let name    = args.first().context("Usage: phi init <name> [dir]")?;
+    let name    = args.first().context("Usage: phi init <n> [dir]")?;
     let out_dir = args.get(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(name.replace(' ', "-")));
 
     fs::create_dir_all(&out_dir).await?;
 
-    // Write starter site files directly (no store needed for init)
-    let index = format!(r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{name}</title>
-<link rel="stylesheet" href="/style.css">
-</head>
-<body>
-<header><nav>
-  <span class="logo">⬡ {name}</span>
-  <div class="links"><a href="/">Home</a><a href="/about.html">About</a></div>
-</nav></header>
-<main>
-  <section class="hero">
-    <h1>{name}</h1>
-    <p class="tagline">Your anonymous site on ΦNET</p>
-  </section>
-  <section>
-    <h2>Welcome</h2>
-    <p>Edit this page to make it your own.</p>
-    <p>After editing, deploy with: <code>phi deploy &lt;hs_id&gt; {}/</code></p>
-  </section>
-</main>
-<footer><p>Hosted on ΦNET · anonymous · encrypted</p></footer>
-<script src="/app.js"></script>
-</body>
-</html>"#, out_dir.display());
 
-    let css = r#"*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#080812;--bg2:#0e0e1c;--bd:#1e2040;--tx:#b8c8e0;--mt:#4a5878;--ac:#3a6cbe;--a2:#5a9cee;--w:700px}
-body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--tx);line-height:1.7;min-height:100vh;display:flex;flex-direction:column}
-a{color:var(--a2);text-decoration:none}a:hover{text-decoration:underline}
-header{background:var(--bg2);border-bottom:1px solid var(--bd)}
-nav{max-width:var(--w);margin:0 auto;padding:.8rem 2rem;display:flex;align-items:center;justify-content:space-between}
-.logo{font-family:monospace;color:var(--ac);font-weight:700}.links{display:flex;gap:1.5rem}.links a{color:var(--mt)}
-main{flex:1;max-width:var(--w);margin:0 auto;padding:3rem 2rem;width:100%}
-section{margin-bottom:2rem;padding:1.5rem;background:var(--bg2);border:1px solid var(--bd);border-radius:10px}
-.hero{text-align:center;padding:2.5rem 1rem}
-.hero h1{font-size:2rem;color:var(--a2);margin-bottom:.5rem}.tagline{color:var(--mt)}
-h2{color:var(--ac);margin-bottom:.8rem}p{color:var(--mt);margin-bottom:.8rem}p:last-child{margin-bottom:0}
-code{background:var(--bg);border:1px solid var(--bd);border-radius:3px;padding:1px 5px;color:var(--a2)}
-footer{text-align:center;padding:1.5rem;border-top:1px solid var(--bd);font-size:.8rem;color:var(--mt);font-family:monospace}"#;
 
-    let js = r#"document.addEventListener("DOMContentLoaded",()=>{
-  document.querySelectorAll("section").forEach((s,i)=>{
-    s.style.cssText="opacity:0;transform:translateY(8px);transition:opacity .3s ease,transform .3s ease";
-    setTimeout(()=>{s.style.opacity="1";s.style.transform="none"},50*i);
-  });
-});"#;
+    let index = format!("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>{name}</title>\n<link rel=\"stylesheet\" href=\"/style.css\">\n</head>\n<body>\n<header><nav>\n  <a href=\"/\" class=\"logo\">&#x2B21; {name}</a>\n  <div class=\"nav-links\"><a href=\"/\">Home</a><a href=\"/about.html\">About</a></div>\n</nav></header>\n<main>\n  <div class=\"hero\">\n    <div class=\"badge\">PHINET Hidden Service</div>\n    <h1>{name}</h1>\n    <p class=\"tagline\">Your anonymous home on PHINET</p>\n  </div>\n  <div class=\"card\">\n    <h2>Welcome</h2>\n    <p>Edit this page to make it your own. This site is hosted anonymously\n    on PHINET &mdash; no server knows your IP, no CA signed your certificate.</p>\n    <p>After editing, deploy with: <code>phi deploy &lt;hs_id&gt; {}/</code></p>\n  </div>\n</main>\n<footer><p>Hosted on PHINET &middot; anonymous &middot; encrypted &middot; no tracking</p></footer>\n<script src=\"/app.js\"></script>\n</body>\n</html>", out_dir.display());
+
+    let css = "*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}:root{--bg:#0a0a14;--surface:#12121e;--card:#17172a;--border:rgba(90,110,200,.18);--accent:#4a7ef0;--accent2:#7aa8ff;--text:#d8e4f8;--muted:#8898bb;--max-w:860px}body{font-family:Inter,'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);line-height:1.7;min-height:100vh;display:flex;flex-direction:column}a{color:var(--accent2);text-decoration:none}a:hover{text-decoration:underline}header{background:rgba(10,10,20,.9);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100}nav{max-width:var(--max-w);margin:0 auto;padding:1rem 2rem;display:flex;align-items:center;justify-content:space-between}.logo{font-weight:700;font-size:1.05rem;color:var(--accent2)}.nav-links{display:flex;gap:1.5rem}.nav-links a{color:var(--muted);font-size:.9rem;transition:color .15s}.nav-links a:hover{color:var(--text);text-decoration:none}main{flex:1;max-width:var(--max-w);width:100%;margin:0 auto;padding:3rem 2rem 4rem}.hero{text-align:center;padding:4rem 2rem 3rem}.badge{display:inline-block;background:rgba(74,126,240,.12);border:1px solid rgba(74,126,240,.3);color:var(--accent2);font-size:.72rem;font-weight:600;letter-spacing:.1em;text-transform:uppercase;padding:.3rem .9rem;border-radius:99px;margin-bottom:1.5rem}h1{font-size:clamp(2rem,6vw,3rem);font-weight:800;letter-spacing:-.02em;color:var(--accent2);margin-bottom:.5rem;line-height:1.15}.tagline{color:var(--muted);font-size:1.05rem;margin-bottom:1.5rem}.addr{display:inline-block;font-family:monospace;font-size:.75rem;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.5rem 1.1rem;color:var(--accent2);word-break:break-all;max-width:100%}.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:2rem;margin-bottom:2rem}.card h2{font-size:1.2rem;font-weight:700;color:var(--text);margin-bottom:.75rem}.card p{color:var(--muted);margin-bottom:.75rem}.card p:last-child{margin-bottom:0}section{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:2rem;margin-bottom:2rem}section h2{font-size:1.2rem;font-weight:700;color:var(--text);margin-bottom:.75rem}section p{color:var(--muted);margin-bottom:.75rem}section p:last-child{margin-bottom:0}code{font-family:monospace;background:rgba(74,126,240,.1);border:1px solid rgba(74,126,240,.2);border-radius:5px;padding:2px 7px;font-size:.85em;color:var(--accent2)}.features{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;margin-bottom:2rem}.feature{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.25rem 1rem;text-align:center;font-size:.8rem;color:var(--muted);line-height:1.4}.feature .icon{font-size:1.4rem;margin-bottom:.4rem}@media(max-width:600px){.features{grid-template-columns:repeat(2,1fr)}main{padding:2rem 1rem 3rem}nav{padding:.8rem 1rem}}footer{text-align:center;padding:1.5rem;border-top:1px solid var(--border);font-size:.78rem;color:var(--muted);font-family:monospace}";
+
+    let js = "document.addEventListener('DOMContentLoaded',()=>{\n  const els=document.querySelectorAll('.hero,.card,.feature,section');\n  els.forEach((el,i)=>{\n    el.style.cssText='opacity:0;transform:translateY(16px);transition:opacity .4s ease,transform .4s ease';\n    setTimeout(()=>{el.style.opacity='1';el.style.transform='none';},80*i);\n  });\n});";
 
     fs::write(out_dir.join("index.html"), index.as_bytes()).await?;
     fs::write(out_dir.join("style.css"),  css.as_bytes()).await?;
@@ -354,6 +310,47 @@ fn format_ts(ts: u64) -> String {
     else                { format!("{}d ago", diff / 86400) }
 }
 
+async fn cmd_circuit_status(_: &[String]) -> Result<()> {
+    if !daemon_online() { bail!("daemon not running"); }
+    let resp = ctl(serde_json::json!({"cmd":"circuit_status"}))
+        .await.context("ctl error")?;
+    let origins = resp["origins"].as_u64().unwrap_or(0);
+    let relays  = resp["relays"].as_u64().unwrap_or(0);
+    println!();
+    println!("  Circuits:");
+    println!("    Originated (we built):       {}", origins);
+    println!("    Relaying (others built):     {}", relays);
+    println!();
+    Ok(())
+}
+
+async fn cmd_circuit_build(args: &[String]) -> Result<()> {
+    let path = args.first()
+        .context("Usage: phi circuit build <node_id@host:port,node_id@host:port,...>")?
+        .clone();
+    if !daemon_online() { bail!("daemon not running"); }
+    println!();
+    println!("  Building circuit through:");
+    for (i, hop) in path.split(',').enumerate() {
+        let hop   = hop.trim();
+        let label = match i { 0 => "guard", 1 => "middle", _ => "exit" };
+        println!("    {}. {:<7}  {}", i + 1, label, hop);
+    }
+    println!();
+    let resp = ctl(serde_json::json!({
+        "cmd":  "build_circuit",
+        "text": path,
+    })).await.context("ctl error")?;
+    if resp["ok"] == true {
+        let cid = resp["circ_id"].as_u64().unwrap_or(0);
+        println!("  {}  Circuit {} established", green("✓"), cid);
+    } else {
+        bail!("{}", resp["error"].as_str().unwrap_or("unknown error"));
+    }
+    println!();
+    Ok(())
+}
+
 async fn cmd_status(_: &[String]) -> Result<()> {
     let store = SiteStore::new();
     let svcs  = store.list_services().await;
@@ -398,6 +395,13 @@ async fn main() -> Result<()> {
                 _ => { eprintln!("Usage: phi board post|read|channels"); }
             }
         }
+        "circuit"               => {
+            match args.get(2).map(|s| s.as_str()) {
+                Some("status") => cmd_circuit_status(&args[3..]).await?,
+                Some("build")  => cmd_circuit_build(&args[3..]).await?,
+                _ => { eprintln!("Usage: phi circuit status|build"); }
+            }
+        }
         "help"|"--help"|"-h" => usage(),
         other      => { eprintln!("Unknown command: {}\n", other); usage(); }
     }
@@ -405,7 +409,7 @@ async fn main() -> Result<()> {
 }
 
 fn usage() {
-    println!("\n  phi -- PHINET hidden service CLI\n\n  Sites:\n    phi new <n>                Create a hidden service\n    phi init <n> [dir]         Generate starter site files\n    phi deploy <hs_id> <dir>   Deploy a directory\n    phi put <hs_id> <url> <f>  Upload a single file\n    phi list                   List all services\n    phi info <hs_id>           Show service files\n    phi delete <hs_id>         Delete a service\n    phi register <hs_id>       Publish to live network\n\n  Board (anonymous messaging):\n    phi board post <ch> <msg>  Post to a channel\n    phi board read [ch]        Read a channel  [default: general]\n    phi board channels         Show channels with posts\n\n  Network:\n    phi peers                  Show connected peers\n    phi status                 Show daemon status\n");
+    println!("\n  phi -- PHINET hidden service CLI\n\n  Sites:\n    phi new <n>                Create a hidden service\n    phi init <n> [dir]         Generate starter site files\n    phi deploy <hs_id> <dir>   Deploy a directory\n    phi put <hs_id> <url> <f>  Upload a single file\n    phi list                   List all services\n    phi info <hs_id>           Show service files\n    phi delete <hs_id>         Delete a service\n    phi register <hs_id>       Publish to live network\n\n  Board (anonymous messaging):\n    phi board post <ch> <msg>  Post to a channel\n    phi board read [ch]        Read a channel  [default: general]\n    phi board channels         Show channels with posts\n\n  Circuits (onion routing):\n    phi circuit status         Show origin/relay counts\n    phi circuit build <path>   Build a multi-hop circuit\n                               path = id@host:port,id@host:port,...\n\n  Network:\n    phi peers                  Show connected peers\n    phi status                 Show daemon status\n");
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
