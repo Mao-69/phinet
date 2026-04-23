@@ -89,7 +89,7 @@ code{background:#131328;border:1px solid #1e2040;border-radius:3px;padding:1px 6
   </svg>
 </div>
 <h1>ΦNET BROWSER</h1>
-<p class="tagline">UTPC CERTS · ONION-ROUTED · OVERLAY NETWORK</p>
+<p class="tagline">ANONYMOUS · ONION-ROUTED · DECENTRALIZED</p>
 <div class="search-box">
   <input id="addr" type="text" placeholder="Enter .phinet address  (40 hex characters)"
     autocomplete="off" spellcheck="false">
@@ -106,7 +106,9 @@ code{background:#131328;border:1px solid #1e2040;border-radius:3px;padding:1px 6
 </div>
 <p class="node-status">${statusDot} ${statusText}</p>
 <p class="notice">
-  ΦNET Hidden Services is still early-stage.
+  Hidden services are not listed or indexed anywhere.<br>
+  You must know the exact 40-character address to visit one.<br>
+  This is by design — discoverability would break anonymity.
 </p>
 <script>
 document.getElementById('addr').addEventListener('keydown', e => { if(e.key==='Enter') go(); });
