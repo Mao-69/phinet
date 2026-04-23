@@ -10,10 +10,14 @@ license.workspace    = true
 tokio.workspace      = true
 tokio-util.workspace = true
 x25519-dalek.workspace  = true
+ed25519-dalek.workspace = true
 chacha20poly1305.workspace = true
+chacha20.workspace         = true
 sha2.workspace       = true
 blake2.workspace     = true
 hkdf.workspace       = true
+hmac.workspace       = true
+subtle.workspace     = true
 rand.workspace       = true
 rand_core.workspace  = true
 zeroize.workspace    = true
@@ -36,3 +40,5 @@ dirs.workspace       = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "=3.10.1"
+tracing-subscriber.workspace = true
