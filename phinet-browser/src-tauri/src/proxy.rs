@@ -176,23 +176,33 @@ async fn send_http(conn: &mut TcpStream, status: u16, ct: &str, body: &[u8]) -> 
 }
 
 fn inject_bar(mut html: Vec<u8>, host: &str, live: bool) -> Vec<u8> {
-    let mode        = if live { "live" } else { "local" };
-    let circle_fill = if live { "#2a7a4a" } else { "#2a4a7a" };
+    // Floating indicator at the bottom of every .phinet page so the
+    // user always knows they're on the overlay network. Uses the
+    // same teal accent (--phi: #39c5cf) as the main UI for visual
+    // continuity. Designed to stay out of the way: low opacity,
+    // pointer-events:none so clicks pass through to page content,
+    // small fixed footer height.
+    let mode_label = if live { "live · onion-routed" } else { "local · cached" };
+    let dot_color  = if live { "#3fb950" } else { "#7d8590" };
     let bar = [
         "<div style=\"position:fixed;bottom:0;left:0;right:0;z-index:2147483647;",
-        "background:rgba(6,6,18,.95);border-top:1px solid #1a1e3a;",
-        "display:flex;align-items:center;gap:10px;padding:5px 14px;",
-        "font-family:monospace;font-size:11px;color:#3a5888;pointer-events:none;\">",
-        "<svg width=\"12\" height=\"12\" viewBox=\"0 0 12 12\" fill=\"none\">",
-        "<polygon points=\"6,1 11,3.5 11,8.5 6,11 1,8.5 1,3.5\" stroke=\"#2a4878\" stroke-width=\"1\" fill=\"none\"/>",
+        "background:rgba(13,17,23,.95);border-top:1px solid #30363d;",
+        "backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);",
+        "display:flex;align-items:center;gap:10px;padding:6px 16px;",
+        "font-family:'Inter',-apple-system,system-ui,sans-serif;",
+        "font-size:11px;color:#7d8590;pointer-events:none;\">",
+        "<svg width=\"14\" height=\"14\" viewBox=\"0 0 14 14\" fill=\"none\">",
+        "<polygon points=\"7,1 12,4 12,10 7,13 2,10 2,4\" stroke=\"#39c5cf\" stroke-width=\"1.2\" fill=\"none\"/>",
+        "<circle cx=\"7\" cy=\"7\" r=\"2\" fill=\"#39c5cf\"/></svg>",
     ].concat();
     let bar2 = format!(
-        "<circle cx=\"6\" cy=\"6\" r=\"2\" fill=\"{circle_fill}\"/></svg>\
-         <span style=\"color:#2a4878;font-weight:700;\">PHINET</span>\
-         <span style=\"color:#161830\">|</span>\
-         <span style=\"color:#4a6898\">{host}</span>\
-         <span style=\"margin-left:auto;color:#1e2840\">{mode} \u{b7} onion-routed \u{b7} encrypted</span>\
-         </div><div style=\"height:26px\"></div>"
+        "<span style=\"color:#39c5cf;font-weight:600;letter-spacing:.02em;\">ΦNET</span>\
+         <span style=\"color:#30363d;\">|</span>\
+         <span style=\"color:#c9d1d9;font-family:'JetBrains Mono',monospace;font-size:10px;\">{host}</span>\
+         <span style=\"display:inline-block;width:6px;height:6px;border-radius:50%;\
+         background:{dot_color};margin-left:auto;box-shadow:0 0 4px {dot_color};\"></span>\
+         <span style=\"color:#7d8590;font-size:10px;\">{mode_label}</span>\
+         </div><div style=\"height:30px\"></div>"
     );
     let full_bar = [bar.as_bytes(), bar2.as_bytes()].concat();
 
@@ -212,13 +222,30 @@ fn inject_bar(mut html: Vec<u8>, host: &str, live: bool) -> Vec<u8> {
 
 fn not_found_html(hs_id: &str) -> Vec<u8> {
     format!(
-        "<html><head><meta charset=\"utf-8\"><title>404</title>\
-         <style>body{{font-family:monospace;background:#080812;color:#b8c8e0;\
-         max-width:560px;margin:60px auto;padding:2rem}}\
-         h1{{color:#c04848}}p{{color:#4a5878}}\
-         code{{background:#0e0e1c;padding:1px 5px;border-radius:3px}}</style>\
-         </head><body><h1>Hidden service not found</h1>\
-         <p>No service at <code>{hs_id}.phinet</code>.</p>\
+        "<html><head><meta charset=\"utf-8\"><title>404 — Not Found</title>\
+         <style>\
+         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono&display=swap');\
+         *{{box-sizing:border-box;margin:0;padding:0}}\
+         body{{font-family:'Inter',-apple-system,system-ui,sans-serif;\
+         background:#0d1117;color:#e6edf3;\
+         max-width:600px;margin:80px auto;padding:2rem;line-height:1.7;\
+         -webkit-font-smoothing:antialiased}}\
+         .icon{{font-size:3rem;margin-bottom:1rem;opacity:.6}}\
+         h1{{color:#f85149;font-size:1.4rem;font-weight:600;margin-bottom:1rem}}\
+         p{{color:#c9d1d9;margin-bottom:.8rem}}\
+         code{{font-family:'JetBrains Mono',monospace;\
+         background:#161b22;border:1px solid #30363d;\
+         border-radius:6px;padding:6px 12px;color:#58a6ff;\
+         display:inline-block;margin-top:.5rem;word-break:break-all}}\
+         .help{{color:#7d8590;font-size:.85rem;margin-top:2rem;\
+         border-top:1px solid #21262d;padding-top:1rem;line-height:1.8}}\
+         </style></head><body>\
+         <div class=\"icon\">🔍</div>\
+         <h1>Hidden service not found</h1>\
+         <p>No service is currently registered at:</p>\
+         <code>{hs_id}.phinet</code>\
+         <p class=\"help\">The service may not be deployed, or your daemon may not have \
+         received its descriptor yet. Try again in a moment, or verify the address.</p>\
          </body></html>"
     ).into_bytes()
 }

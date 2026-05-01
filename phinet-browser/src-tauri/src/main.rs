@@ -183,12 +183,168 @@ async fn fetch_page(url: String, state: State<'_, AppState>) -> Result<FetchResu
         });
     }
 
-    // Clearnet URLs: not supported in this build
-    // (would need reqwest or system proxy; browser is .phinet-focused)
-    Err(format!(
-        "Clearnet URLs are not yet supported. Navigate to a .phinet address instead.\n\
-         URL attempted: {url}"
-    ))
+    // ── Clearnet (HTTP/HTTPS) ─────────────────────────────────────
+    //
+    // Real-world web fetch via reqwest + rustls. No openssl dep, so
+    // this works cross-platform without any system TLS configuration.
+    //
+    // Design notes:
+    //   * `User-Agent` mimics a stock browser to avoid the long tail
+    //     of sites that reject obviously-headless clients.
+    //   * No referer header — privacy-preserving default.
+    //   * Auto-decoding for gzip/brotli/deflate is handled by reqwest.
+    //   * Redirects follow up to 10 hops (reqwest default).
+    //   * No cookies are persisted between fetches — each call is
+    //     stateless. A future cookie-jar feature would attach here.
+    //   * 30-second total timeout protects against pathological sites
+    //     that hang the connection without sending data.
+    fetch_clearnet(&url).await
+}
+
+async fn fetch_clearnet(url: &str) -> Result<FetchResult, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(
+            "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) \
+             Gecko/20100101 Firefox/128.0"
+        )
+        // Don't auto-add a Referer when following redirects — the
+        // ΦNET browser is privacy-first.
+        .referer(false)
+        .build()
+        .map_err(|e| format!("HTTP client init: {e}"))?;
+
+    let resp = client.get(url).send().await
+        .map_err(|e| format!("Fetch failed: {e}"))?;
+
+    let status = resp.status().as_u16();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+
+    // Cap body at 50MB so a runaway response doesn't OOM the renderer.
+    // We accumulate chunks and check size on each one — checking only
+    // after the full body is read defeats the purpose, since a server
+    // claiming Content-Length: 100GB would already have OOMed us.
+    const MAX_BODY: usize = 50 * 1024 * 1024;
+
+    use futures_util::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Read body: {e}"))?;
+        if buf.len() + chunk.len() > MAX_BODY {
+            return Err(format!(
+                "Response too large (max {} MB)",
+                MAX_BODY / (1024 * 1024)
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    Ok(FetchResult {
+        status,
+        content_type,
+        body_hex: hex::encode(&buf),
+        is_phinet: false,
+    })
+}
+
+#[derive(Serialize)]
+struct SubresourceResult {
+    status:       u16,
+    content_type: String,
+    /// Base64-encoded raw body. Base64 instead of hex because
+    /// subresources are often binary (images, fonts) and base64
+    /// is 33% smaller than hex over the IPC boundary, which adds
+    /// up when a page loads dozens of resources.
+    body_b64:     String,
+}
+
+/// Fetch any subresource the iframe asks for. Called by the preload
+/// script's overridden `window.fetch` and `XMLHttpRequest`. Routes:
+///
+///   - `phinet://hs_id/path` → daemon (already proxied via custom
+///     URI scheme handler, but iframe srcdoc can't always reach
+///     custom schemes for fetch(), so we re-route here for symmetry).
+///   - Bare relative paths → caller is expected to resolve them
+///     against the page's base href before calling, but as a
+///     fallback we treat unknown schemes as errors.
+///   - `http(s)://...` → plain reqwest fetch, same code path as the
+///     top-level fetch_clearnet.
+///
+/// All responses come back base64-encoded so binary content survives
+/// the JSON IPC channel intact.
+#[tauri::command]
+async fn fetch_subresource(url: String, method: Option<String>) -> Result<SubresourceResult, String> {
+    let _method = method.unwrap_or_else(|| "GET".into());
+
+    // Route by scheme
+    if let Some(rest) = url.strip_prefix("phinet://") {
+        // phinet://hs_id/path → daemon hs_fetch
+        let (host, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None    => (rest, "/"),
+        };
+        if host.is_empty() {
+            return Err("empty hs_id in phinet:// URL".into());
+        }
+        let daemon_result = fetch_via_daemon(host, path).await
+            .ok_or_else(|| format!("daemon fetch failed for {}", url))?;
+        let bytes = hex::decode(&daemon_result.body_hex)
+            .map_err(|e| format!("body hex decode: {e}"))?;
+        return Ok(SubresourceResult {
+            status:       daemon_result.status,
+            content_type: daemon_result.content_type,
+            body_b64:     base64_encode(&bytes),
+        });
+    }
+
+    if url.starts_with("http://") || url.starts_with("https://") {
+        // Reuse the existing clearnet fetcher for consistency. It
+        // already handles streaming-with-cap, gzip/brotli, sane
+        // timeouts, no Referer/cookies. The only conversion is
+        // body_hex → body_b64.
+        let r = fetch_clearnet(&url).await?;
+        let bytes = hex::decode(&r.body_hex)
+            .map_err(|e| format!("body hex decode: {e}"))?;
+        return Ok(SubresourceResult {
+            status:       r.status,
+            content_type: r.content_type,
+            body_b64:     base64_encode(&bytes),
+        });
+    }
+
+    Err(format!("unsupported subresource URL scheme: {}", url))
+}
+
+/// Standard base64 encode without padding control. Using a small
+/// inline implementation to avoid pulling in another dep just for
+/// this one function. ~10 lines.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(ALPHA[(b0 >> 2) as usize] as char);
+        out.push(ALPHA[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHA[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHA[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }
 
 async fn fetch_via_daemon(hs_id: &str, path: &str) -> Option<FetchResult> {
@@ -224,19 +380,69 @@ async fn fetch_via_daemon(hs_id: &str, path: &str) -> Option<FetchResult> {
     Some(FetchResult { status, content_type: ct, body_hex, is_phinet: true })
 }
 
+/// Fetch a phinet:// subresource through the daemon. Used by the
+/// custom URI scheme handler. Returns (status, content_type, body_bytes).
+///
+/// URL format: `phinet://<hs_id>/<path>`. We extract hs_id from the
+/// host part and the rest as the path. The daemon's hs_fetch handler
+/// returns hex-encoded bodies — we decode to raw bytes here so the
+/// WebView gets the binary content (images, etc.) intact.
+async fn fetch_phinet_subresource(
+    url: &str,
+    _socks_port: u16,
+) -> std::result::Result<(u16, String, Vec<u8>), String> {
+    // Parse: phinet://hs_id[/path]
+    let url = url.strip_prefix("phinet://")
+        .ok_or_else(|| "url missing phinet:// prefix".to_string())?;
+    let (host, path) = match url.find('/') {
+        Some(i) => (&url[..i], &url[i..]),
+        None    => (url, "/"),
+    };
+    if host.is_empty() {
+        return Err("empty hs_id in phinet:// URL".into());
+    }
+
+    // Reuse the existing daemon-fetch path. The daemon handles
+    // descriptor lookup, rendezvous setup, circuit construction,
+    // HTTP request through the rendezvous circuit. All we do here
+    // is the hex-decode of the body.
+    let result = fetch_via_daemon(host, path).await
+        .ok_or_else(|| format!("daemon could not fetch phinet://{}{}", host, path))?;
+
+    let bytes = hex::decode(&result.body_hex)
+        .map_err(|e| format!("body decode: {e}"))?;
+    Ok((result.status, result.content_type, bytes))
+}
+
 fn not_found_html(hs_id: &str, _url: &str) -> Vec<u8> {
     format!(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Not found</title>\
-         <style>body{{font-family:monospace;background:#080812;color:#b8c8e0;\
-         max-width:560px;margin:60px auto;padding:2rem;line-height:1.7}}\
-         h1{{color:#c04848}}p{{color:#4a5878}}\
-         code{{background:#0e0e1c;padding:1px 6px;border-radius:3px;color:#8ab4e8}}</style>\
-         </head><body>\
+         <style>\
+         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono&display=swap');\
+         *{{box-sizing:border-box;margin:0;padding:0}}\
+         body{{font-family:'Inter',-apple-system,system-ui,sans-serif;\
+         background:#0d1117;color:#e6edf3;\
+         max-width:600px;margin:80px auto;padding:2rem;line-height:1.7;\
+         -webkit-font-smoothing:antialiased}}\
+         .icon{{font-size:3rem;margin-bottom:1rem;opacity:.6}}\
+         h1{{color:#f85149;font-size:1.4rem;font-weight:600;margin-bottom:1rem}}\
+         p{{color:#c9d1d9;margin-bottom:.8rem}}\
+         code{{font-family:'JetBrains Mono',monospace;\
+         background:#161b22;border:1px solid #30363d;\
+         border-radius:4px;padding:2px 8px;color:#58a6ff;\
+         word-break:break-all;font-size:.9em}}\
+         .deploy{{color:#7d8590;font-size:.9rem;margin-top:1.5rem;\
+         border-top:1px solid #21262d;padding-top:1rem;line-height:2}}\
+         .deploy code{{display:inline-block;padding:4px 10px;margin-top:4px}}\
+         </style></head><body>\
+         <div class=\"icon\">🔍</div>\
          <h1>Site not found</h1>\
          <p><code>{hs_id}.phinet</code></p>\
+         <div class=\"deploy\">\
          <p>Make sure the daemon is running and the site has been deployed:</p>\
-         <p><code>phinet-daemon --port 7700</code></p>\
-         <p><code>phi deploy {hs_id} ./my-site/</code></p>\
+         <code>phinet-daemon --port 7700</code><br>\
+         <code>phi deploy {hs_id} ./my-site/</code>\
+         </div>\
          </body></html>"
     ).into_bytes()
 }
@@ -281,7 +487,58 @@ fn main() {
 
     info!("PHINET Browser — proxy on 127.0.0.1:{}", socks_port);
 
+    // Register a custom phinet:// URI scheme so iframes loading
+    // .phinet content can fetch subresources (images, CSS, JS)
+    // through our local SOCKS proxy. Without this, iframe-srcdoc
+    // pages can render top-level HTML but every <img>/<link> 404s
+    // because the iframe has no context for relative URLs.
+    //
+    // Wire format: phinet://<hs_id>/<path> → proxy to <hs_id>.phinet/<path>
+    // through the local SOCKS5 daemon, return raw bytes with the
+    // upstream Content-Type. The WebView treats these like any
+    // other HTTP response.
+    let socks_for_proto = socks_port;
+
     tauri::Builder::default()
+        .register_uri_scheme_protocol("phinet", move |_app, req| {
+            let socks = socks_for_proto;
+            let url = req.uri().to_string();
+            // The WebView decodes the response synchronously, but we
+            // need an async runtime to do the SOCKS5 dial + HTTP
+            // fetch. Block on a one-shot tokio runtime.
+            let body = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("rt: {e}"))?;
+                rt.block_on(fetch_phinet_subresource(&url, socks))
+            }).join().unwrap_or_else(|_| Err("thread panic".into()));
+
+            match body {
+                Ok((status, content_type, bytes)) => {
+                    tauri::http::Response::builder()
+                        .status(status)
+                        .header("Content-Type", content_type)
+                        // Allow the page itself to embed these resources.
+                        .header("Access-Control-Allow-Origin", "*")
+                        .body(bytes)
+                        .unwrap_or_else(|_| {
+                            tauri::http::Response::builder()
+                                .status(500)
+                                .body(b"phinet:// internal error".to_vec())
+                                .unwrap()
+                        })
+                }
+                Err(e) => {
+                    tracing::warn!("phinet:// {} failed: {}", url, e);
+                    tauri::http::Response::builder()
+                        .status(502)
+                        .header("Content-Type", "text/plain; charset=utf-8")
+                        .body(format!("phinet:// fetch error: {e}").into_bytes())
+                        .unwrap()
+                }
+            }
+        })
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
@@ -297,6 +554,7 @@ fn main() {
             delete_service,
             register_service,
             fetch_page,
+            fetch_subresource,
             connect_peer,
             socks_proxy_port,
         ])
