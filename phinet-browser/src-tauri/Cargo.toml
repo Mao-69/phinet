@@ -31,3 +31,14 @@ hex                  = "0.4"
 tracing              = "0.1"
 tracing-subscriber   = { version = "0.3", features = ["env-filter"] }
 rand                 = "0.8"
+# rustls-tls ensures no openssl/system-tls dependency — pure-Rust TLS,
+# bundled CA roots via rustls-native-certs, fully cross-platform.
+# reqwest with default features. Default = native-tls (OpenSSL on
+# Linux, SChannel on Windows, SecureTransport on macOS) + gzip +
+# http2 + json. We could prefer rustls-tls for pure-Rust TLS, but
+# the feature name changed between reqwest 0.12 and 0.13 and varies
+# by index version, making the spec unreliable across environments.
+# Default-TLS is portable: it works on every platform out of the
+# box and uses the system's pre-vetted certificate store.
+reqwest              = { version = "0.13", features = ["gzip", "brotli", "deflate", "http2", "stream"] }
+futures-util         = "0.3"
