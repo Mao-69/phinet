@@ -24,6 +24,9 @@ pub mod dht;
 pub mod hidden_service;
 pub mod board;
 pub mod node;
+pub mod directory;
+pub mod transport;
+pub mod path_select;
 pub mod store;
 pub mod error;
 

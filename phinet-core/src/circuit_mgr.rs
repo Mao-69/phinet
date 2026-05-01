@@ -102,6 +102,13 @@ pub struct OriginCircuit {
     /// delivered up the circuit; we emit a SENDME every
     /// `CIRCUIT_SENDME_DELIVERED` cells to refill the peer's window.
     pub circ_delivered_since_sendme: i32,
+    /// Instant of the most recent activity on this circuit (cell sent
+    /// or received in either direction). Used by the idle-eviction
+    /// loop to drop circuits that haven't been used in
+    /// `CIRCUIT_IDLE_TIMEOUT`. Without this, a long-running daemon
+    /// accumulates dead circuits forever — each one holds memory for
+    /// key state, stream muxes, hop keys, etc.
+    pub last_activity: std::time::Instant,
 }
 
 impl OriginCircuit {
@@ -115,7 +122,15 @@ impl OriginCircuit {
             streams: std::sync::Arc::new(crate::stream::StreamMux::new()),
             circ_send_window: crate::stream::CIRCUIT_WINDOW_START,
             circ_delivered_since_sendme: 0,
+            last_activity: std::time::Instant::now(),
         }
+    }
+
+    /// Refresh the last-activity timestamp. Called on every cell sent
+    /// or received on this circuit, so the idle-eviction loop treats
+    /// the circuit as live.
+    pub fn touch(&mut self) {
+        self.last_activity = std::time::Instant::now();
     }
 
     /// Attempt to consume one slot from the circuit's outbound DATA
@@ -184,6 +199,7 @@ impl OriginCircuit {
         for i in (0..=target_hop).rev() {
             onion_encrypt_forward(&mut self.hops[i], &mut payload);
         }
+        self.last_activity = std::time::Instant::now();
         Ok(payload)
     }
 
@@ -204,6 +220,7 @@ impl OriginCircuit {
                     let mut tmp = payload;
                     tmp[5] = 0; tmp[6] = 0; tmp[7] = 0; tmp[8] = 0;
                     self.hops[i].backward_digest.update(&tmp);
+                    self.last_activity = std::time::Instant::now();
                     return Some((i, rc));
                 }
             }
@@ -236,6 +253,10 @@ pub struct RelayCircuit {
     pub circ_send_window: i32,
     /// Exit-side inbound DATA count for circuit SENDME emission.
     pub circ_delivered_since_sendme: i32,
+    /// Instant of the most recent cell activity on this relay circuit.
+    /// Used by idle-eviction — a relay that hasn't forwarded anything
+    /// in CIRCUIT_IDLE_TIMEOUT is torn down to free middle-hop state.
+    pub last_activity: std::time::Instant,
 }
 
 impl RelayCircuit {
@@ -268,6 +289,12 @@ impl RelayCircuit {
 
     pub fn reset_circ_delivered(&mut self) {
         self.circ_delivered_since_sendme = 0;
+    }
+
+    /// Refresh last-activity timestamp. Called on each cell forwarded
+    /// through this middle hop so idle eviction treats it as live.
+    pub fn touch(&mut self) {
+        self.last_activity = std::time::Instant::now();
     }
 }
 
@@ -333,6 +360,57 @@ impl CircuitManager {
 
     fn fresh_origin_id(&self) -> CircuitId {
         CircuitId(self.next_origin_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Drop circuits that haven't seen activity in
+    /// `CIRCUIT_IDLE_TIMEOUT`. Returns the count evicted, for logging.
+    ///
+    /// Evicts both origin circuits and relay circuits independently —
+    /// each type has its own `last_activity` timestamp. Stream state
+    /// attached to evicted circuits is dropped along with the circuit
+    /// (Arc<StreamMux> drops to zero refcount). Any pending handshakes
+    /// (`OriginCircuit.pending`) are also dropped, which is the right
+    /// semantics: if an ntor reply didn't arrive in 1 hour, the peer
+    /// is unreachable.
+    ///
+    /// Also cleans up associated rendezvous state for the evicted
+    /// circuits (pending_rendezvous, intro_circuits) so adversaries
+    /// can't exhaust the server by spraying half-built circuits.
+    pub fn evict_idle_circuits(&mut self) -> (usize, usize) {
+        let now = std::time::Instant::now();
+        let timeout = crate::circuit::CIRCUIT_IDLE_TIMEOUT;
+
+        let dead_origins: Vec<CircuitId> = self.origins.iter()
+            .filter(|(_, c)| now.duration_since(c.last_activity) > timeout)
+            .map(|(id, _)| *id)
+            .collect();
+
+        for cid in &dead_origins {
+            self.origins.remove(cid);
+            // Clean up rendezvous state keyed by this cid
+            self.intro_circuits.retain(|_, v| v != cid);
+            self.pending_rendezvous.retain(|_, (rp_cid, _, _, _)| rp_cid != cid);
+            self.e2e_keys.remove(cid);
+        }
+
+        let dead_relays: Vec<(PeerId, CircuitId)> = self.relays.iter()
+            .filter(|(_, rc)| now.duration_since(rc.last_activity) > timeout)
+            .map(|(key, _)| *key)
+            .collect();
+
+        for key in &dead_relays {
+            if let Some(rc) = self.relays.remove(key) {
+                if let (Some(np), Some(nc)) = (rc.next_peer, rc.next_circ_id) {
+                    self.relay_by_next.remove(&(np, nc));
+                }
+            }
+            // Also clear intro_registered pointing at this relay circuit
+            self.intro_registered.retain(|(p, c), _| (*p, *c) != *key);
+            // Rendezvous cookies that point at this (peer, cid) are stale
+            self.rendezvous_cookies.retain(|_, (p, c)| (*p, *c) != *key);
+        }
+
+        (dead_origins.len(), dead_relays.len())
     }
 
     // ── Origin side ───────────────────────────────────────────────────
@@ -468,6 +546,7 @@ impl CircuitManager {
             exit_streams:      std::sync::Arc::new(crate::stream::StreamMux::new()),
             circ_send_window:            crate::stream::CIRCUIT_WINDOW_START,
             circ_delivered_since_sendme: 0,
+            last_activity:               std::time::Instant::now(),
         };
         self.relays.insert((from_peer, cid), rc);
 
@@ -498,6 +577,7 @@ impl CircuitManager {
 
         let mut payload = cell.payload;
         onion_decrypt_forward(&mut rc.hop, &mut payload);
+        rc.last_activity = std::time::Instant::now();
 
         if let Ok(relay) = RelayCell::from_payload(&payload) {
             if relay.is_recognized_at(&payload, &rc.hop.forward_digest) {
@@ -1039,6 +1119,7 @@ mod tests {
             exit_streams: std::sync::Arc::new(crate::stream::StreamMux::new()),
             circ_send_window:            crate::stream::CIRCUIT_WINDOW_START,
             circ_delivered_since_sendme: 0,
+            last_activity:               std::time::Instant::now(),
         };
         rc.try_consume_circ_window().unwrap();
         assert_eq!(rc.circ_send_window, crate::stream::CIRCUIT_WINDOW_START - 1);
@@ -1054,5 +1135,75 @@ mod tests {
         assert!(crate::stream::CIRCUIT_WINDOW_START
                 > crate::stream::STREAM_WINDOW_START,
                 "CIRCUIT_WINDOW_START must exceed STREAM_WINDOW_START");
+    }
+
+    // ── Idle eviction ─────────────────────────────────────────────────
+
+    #[test]
+    fn evict_idle_circuits_keeps_fresh_ones() {
+        // A freshly-touched circuit must survive an eviction pass.
+        let mut mgr = CircuitManager::new();
+        mgr.origins.insert(CircuitId(1), OriginCircuit::new(CircuitId(1), [0u8;32]));
+        assert_eq!(mgr.origins.len(), 1);
+        let (o, r) = mgr.evict_idle_circuits();
+        assert_eq!(o, 0, "fresh origin must not be evicted");
+        assert_eq!(r, 0);
+        assert_eq!(mgr.origins.len(), 1);
+    }
+
+    #[test]
+    fn evict_idle_circuits_reaps_stale_ones() {
+        // Manually backdate last_activity past the timeout and verify
+        // the eviction sweep removes the circuit.
+        let mut mgr = CircuitManager::new();
+        let mut c = OriginCircuit::new(CircuitId(42), [0u8;32]);
+        c.last_activity = std::time::Instant::now()
+            - crate::circuit::CIRCUIT_IDLE_TIMEOUT
+            - std::time::Duration::from_secs(1);
+        mgr.origins.insert(CircuitId(42), c);
+
+        let (o, _r) = mgr.evict_idle_circuits();
+        assert_eq!(o, 1, "stale origin circuit must be evicted");
+        assert!(mgr.origins.is_empty());
+    }
+
+    #[test]
+    fn eviction_cleans_up_rendezvous_state_for_dead_circuits() {
+        // Rendezvous tables keyed by (or pointing at) an evicted
+        // circuit id must not retain stale entries — otherwise a
+        // long-running node's rendezvous state grows forever.
+        let mut mgr = CircuitManager::new();
+        let cid  = CircuitId(99);
+        let peer = [0x42u8; 32];
+
+        let mut c = OriginCircuit::new(cid, peer);
+        c.last_activity = std::time::Instant::now()
+            - crate::circuit::CIRCUIT_IDLE_TIMEOUT
+            - std::time::Duration::from_secs(1);
+        mgr.origins.insert(cid, c);
+        mgr.intro_circuits.insert([0xAA; 32], cid);
+
+        assert_eq!(mgr.intro_circuits.len(), 1);
+        let (o, _r) = mgr.evict_idle_circuits();
+        assert_eq!(o, 1);
+        assert!(mgr.intro_circuits.is_empty(),
+            "intro_circuits entry pointing at dead cid must be cleaned up");
+    }
+
+    #[test]
+    fn touch_prevents_eviction() {
+        // A circuit whose last_activity is stale is evicted by default.
+        // After .touch() bumps it to now, eviction leaves it alone.
+        let mut mgr = CircuitManager::new();
+        let cid = CircuitId(7);
+        let mut c = OriginCircuit::new(cid, [0u8;32]);
+        c.last_activity = std::time::Instant::now()
+            - crate::circuit::CIRCUIT_IDLE_TIMEOUT
+            - std::time::Duration::from_secs(1);
+        c.touch();  // refresh
+        mgr.origins.insert(cid, c);
+
+        let (o, _r) = mgr.evict_idle_circuits();
+        assert_eq!(o, 0, "touched circuit must survive eviction");
     }
 }

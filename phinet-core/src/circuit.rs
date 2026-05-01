@@ -39,6 +39,18 @@ pub const RELAY_DATA_MAX: usize = CELL_PAYLOAD - RELAY_HEADER; // 496
 /// EXTEND bound and invites circuit-length correlation.
 pub const MAX_HOPS: usize = 5;
 
+/// How long a circuit can sit idle (no cells in either direction)
+/// before the idle-eviction loop tears it down. Matches Tor's
+/// CircuitTimeout default: circuits get expensive (key state, stream
+/// muxes, hop HopStates) and a long-running daemon that never evicts
+/// would leak them forever.
+///
+/// 1 hour is long enough that a user's occasional web browsing holds
+/// the same circuit (useful: rebuilding a 3-hop circuit costs a round
+/// trip per hop), but short enough that abandoned circuits don't
+/// accumulate.
+pub const CIRCUIT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// Number of `RELAY_EARLY` cells a client is allowed to emit per
 /// circuit. Exactly `MAX_HOPS` — one per EXTEND. Enforced so a
 /// compromised hop cannot silently extend the circuit further.

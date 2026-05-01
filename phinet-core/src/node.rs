@@ -28,7 +28,7 @@ use std::{
 };
 use tokio::{
     io::{BufReader, BufWriter},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     sync::{mpsc, Mutex, RwLock as ARwLock},
     time,
 };
@@ -156,6 +156,19 @@ pub struct PhiNode {
     /// when `shutdown()` is called could wake up and do one more
     /// iteration before seeing the Notify.
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+
+    /// Pluggable transport for peer-to-peer connections. Default
+    /// is `PlainTcp`. Operators in censored regions can swap in a
+    /// `SubprocessTransport` wrapping obfs4proxy/meek-client/snowflake-client
+    /// to disguise ΦNET traffic.
+    ///
+    /// **Currently used for outbound `connect()` only.** The accept
+    /// loop in `run()` still binds a raw TCP listener — relays accept
+    /// connections from many transports, and which one a peer dialed
+    /// in on isn't visible here (the obfs is on the wire below us).
+    /// Replacing the listener with `transport.listen()` is a
+    /// straightforward extension when needed.
+    pub transport: Arc<dyn crate::transport::Transport>,
 }
 
 impl PhiNode {
@@ -221,6 +234,7 @@ impl PhiNode {
             high_security: false,
             shutdown:      Arc::new(tokio::sync::Notify::new()),
             shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            transport: Arc::new(crate::transport::PlainTcp),
         })
     }
 
@@ -285,6 +299,20 @@ impl PhiNode {
                     if dropped > 0 {
                         debug!("replay: evicted {} expired entries", dropped);
                     }
+                    // Idle circuit eviction: reclaim state from
+                    // circuits that haven't been used in
+                    // CIRCUIT_IDLE_TIMEOUT. Without this, a daemon
+                    // running for weeks accumulates dead circuits
+                    // forever (each one holds ~KB of key state +
+                    // stream mux).
+                    let (o, r) = {
+                        let mut mgr = n.circuits.write().await;
+                        mgr.evict_idle_circuits()
+                    };
+                    if o > 0 || r > 0 {
+                        info!("evicted {} idle origin circuits and {} idle relay circuits",
+                              o, r);
+                    }
                 }
                 debug!("gc loop: shutting down");
             });
@@ -337,8 +365,17 @@ impl PhiNode {
 
     // ── Handshake (responder) ─────────────────────────────────────────
 
-    async fn handle_incoming(self: Arc<Self>, stream: TcpStream, addr: SocketAddr) -> Result<()> {
-        let (r, w)  = stream.into_split();
+    async fn handle_incoming<S>(self: Arc<Self>, stream: S, addr: SocketAddr) -> Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        // Use tokio::io::split (works on any Unpin AsyncRead+AsyncWrite)
+        // instead of TcpStream::into_split. The latter is only on
+        // OwnedReadHalf/OwnedWriteHalf which are TCP-specific. Going
+        // generic lets the same handler accept connections from
+        // PlainTcp transport, obfs4 SOCKS5 streams, future TLS-wrapped
+        // streams, etc — exactly what the Transport abstraction is for.
+        let (r, w)  = tokio::io::split(stream);
         let mut rd  = BufReader::new(r);
         let mut wr  = BufWriter::new(w);
 
@@ -395,8 +432,12 @@ impl PhiNode {
     // ── Connect (initiator) ───────────────────────────────────────────
 
     pub async fn connect(self: Arc<Self>, host: &str, port: u16) -> Result<()> {
-        let stream  = TcpStream::connect(format!("{}:{}", host, port)).await?;
-        let (r, w)  = stream.into_split();
+        // Dial via the configured transport. Default is PlainTcp; an
+        // operator running with obfs4 / meek / snowflake configured
+        // gets the obfuscated bytes-on-wire here transparently.
+        let stream = self.transport.dial(host, port).await
+            .map_err(|e| Error::Handshake(format!("transport dial: {e}")))?;
+        let (r, w)  = tokio::io::split(stream);
         let mut rd  = BufReader::new(r);
         let mut wr  = BufWriter::new(w);
 
@@ -442,13 +483,17 @@ impl PhiNode {
 
     // ── Peer registration ─────────────────────────────────────────────
 
-    async fn register_peer(
+    async fn register_peer<R, W>(
         self: Arc<Self>,
         info: PeerInfo,
         session: Arc<Session>,
-        reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
-        writer: BufWriter<tokio::net::tcp::OwnedWriteHalf>,
-    ) -> Result<()> {
+        reader: BufReader<R>,
+        writer: BufWriter<W>,
+    ) -> Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         // Reject connections to ourselves
         if info.node_id == self.node_id() {
             debug!("Rejected self-connection from {}:{}", info.host, info.port);
