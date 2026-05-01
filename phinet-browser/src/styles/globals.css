@@ -1,22 +1,80 @@
-/* ΦNET Browser — Global Styles */
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap');
+/* ΦNET Browser — Global Styles
+ *
+ * Modern dark theme. Design choices:
+ *
+ *   • Background ladder uses near-black blue (#0d1117 → #161b22 → #21262d)
+ *     similar to GitHub's dark theme — high contrast against text
+ *     without being harsh.
+ *   • Text is off-white (#e6edf3) instead of muted blue-gray for
+ *     strong readability across both reading and code.
+ *   • Accent is a clear electric blue (#2f81f7) that pops on dark
+ *     and reads as "tech / network / link" without being neon.
+ *   • Success/danger/warning colors use modern web-app palette,
+ *     accessible at 4.5:1 contrast ratio against backgrounds.
+ *   • A subtle teal (#39c5cf) for ΦNET-specific accents — connection
+ *     state, hidden-service indicators — distinct from the action
+ *     blue so the eye learns "blue = clickable, teal = ΦNET status."
+ *   • Typography: Inter for UI, JetBrains Mono only where monospace
+ *     is needed (addresses, hashes, code). Mono-everything was
+ *     hostile to readability.
+ *   • Borders are subtle (#30363d) and used sparingly — most surfaces
+ *     are distinguished by background tone alone.
+ *   • Shadows give depth without being heavy. Backdrop blur on
+ *     overlays.
+ */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
 
 :root {
-  --bg:       #080812;
-  --bg2:      #0e0e1c;
-  --bg3:      #131328;
-  --bd:       #1e2040;
-  --bd2:      #262650;
-  --tx:       #b8c8e0;
-  --mt:       #4a5878;
-  --ac:       #3a6cbe;
-  --ac2:      #5a9cee;
-  --green:    #3a9e6a;
-  --red:      #c04848;
-  --amber:    #c08030;
-  --teal:     #2a9898;
-  --bar:      #060610;
-  --font:     'JetBrains Mono', 'Cascadia Code', 'Fira Mono', monospace;
+  /* ── Background ladder ─────────────────────────────────────────── */
+  /* Each step ~+10 lightness so layered surfaces are distinguishable. */
+  --bg:        #0d1117;   /* page background */
+  --bg2:       #161b22;   /* tab bar, panels */
+  --bg3:       #21262d;   /* nav buttons hover, inputs */
+  --bg4:       #30363d;   /* input borders, hovers */
+  --bar:       #010409;   /* status bar — slightly darker than bg */
+
+  /* ── Borders ───────────────────────────────────────────────────── */
+  --bd:        #30363d;   /* primary border */
+  --bd2:       #444c56;   /* hovered / focused border */
+
+  /* ── Text ──────────────────────────────────────────────────────── */
+  --tx:        #e6edf3;   /* primary text — high contrast */
+  --tx2:       #c9d1d9;   /* secondary text */
+  --mt:        #7d8590;   /* muted text — labels, hints */
+  --mt2:       #484f58;   /* very muted — separators, decorative */
+
+  /* ── Accents ───────────────────────────────────────────────────── */
+  --ac:        #2f81f7;   /* primary action — electric blue */
+  --ac2:       #58a6ff;   /* lighter accent for headings, hover */
+  --ac-soft:   rgba(47, 129, 247, 0.15);  /* tinted backgrounds */
+
+  /* ΦNET-specific brand color — distinct from action blue so users
+   * learn "teal = ΦNET status, blue = clickable". */
+  --phi:       #39c5cf;
+  --phi-soft:  rgba(57, 197, 207, 0.15);
+
+  /* ── Status colors ─────────────────────────────────────────────── */
+  --green:     #3fb950;
+  --green-soft: rgba(63, 185, 80, 0.15);
+  --red:       #f85149;
+  --red-soft:  rgba(248, 81, 73, 0.15);
+  --amber:     #d29922;
+  --amber-soft: rgba(210, 153, 34, 0.15);
+
+  /* ── Typography ────────────────────────────────────────────────── */
+  --font:      'Inter', -apple-system, 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', 'Cascadia Code', monospace;
+
+  /* ── Shadows ───────────────────────────────────────────────────── */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.55);
+
+  /* ── Radii ─────────────────────────────────────────────────────── */
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 10px;
 }
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -26,67 +84,135 @@ html, body, #root {
   background: var(--bg);
   color: var(--tx);
   font-family: var(--font);
-  font-size: 12px;
+  font-size: 13px;
+  line-height: 1.5;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   user-select: none;
   overflow: hidden;
 }
 
-/* Scrollbars */
-::-webkit-scrollbar          { width: 6px; background: var(--bg2); }
-::-webkit-scrollbar-thumb    { background: var(--bd); border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: var(--mt); }
+/* ── Scrollbars ──────────────────────────────────────────────────── */
 
-/* Selection */
+::-webkit-scrollbar          { width: 10px; height: 10px; background: transparent; }
+::-webkit-scrollbar-thumb    {
+  background: var(--bd);
+  border-radius: 5px;
+  border: 2px solid var(--bg);
+}
+::-webkit-scrollbar-thumb:hover { background: var(--bd2); }
+
+/* ── Selection ──────────────────────────────────────────────────── */
+
 ::selection { background: var(--ac); color: #fff; }
 
-/* Buttons */
+/* ── Buttons ─────────────────────────────────────────────────────── */
+
 button {
   font-family: var(--font);
-  font-size: 11px;
+  font-size: 12px;
+  font-weight: 500;
   cursor: pointer;
   border: 1px solid var(--bd);
-  border-radius: 4px;
+  border-radius: var(--r-sm);
   background: var(--bg3);
   color: var(--tx);
-  padding: 5px 10px;
-  transition: border-color .15s, color .15s;
+  padding: 6px 12px;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
 }
-button:hover  { border-color: var(--ac); color: var(--ac2); }
-button:active { background: var(--bg2); }
+button:hover  {
+  background: var(--bg4);
+  border-color: var(--bd2);
+  color: var(--tx);
+}
+button:active { background: var(--bg3); transform: translateY(1px); }
+button:focus-visible {
+  outline: 2px solid var(--ac);
+  outline-offset: 1px;
+}
 
 button.primary {
   background: var(--ac);
   border-color: var(--ac);
   color: #fff;
-  font-weight: 500;
+  font-weight: 600;
 }
-button.primary:hover { background: var(--ac2); border-color: var(--ac2); color: #fff; }
+button.primary:hover  { background: var(--ac2); border-color: var(--ac2); }
+button.primary:active { background: var(--ac);  border-color: var(--ac);  }
 
 button.danger  { background: var(--red);   border-color: var(--red);   color: #fff; }
-button.danger:hover { background: #d05050; border-color: #d05050; color: #fff; }
+button.danger:hover  { background: #ff6b63; border-color: #ff6b63; }
 
-/* Inputs */
+button.ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--tx2);
+}
+button.ghost:hover { background: var(--bg3); color: var(--tx); }
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+/* ── Inputs ──────────────────────────────────────────────────────── */
+
 input, textarea {
   font-family: var(--font);
-  font-size: 12px;
-  background: var(--bg3);
+  font-size: 13px;
+  background: var(--bg);
   border: 1px solid var(--bd);
-  border-radius: 4px;
+  border-radius: var(--r-sm);
   color: var(--tx);
-  padding: 5px 8px;
+  padding: 7px 10px;
   outline: none;
+  transition: border-color 0.12s ease, background 0.12s ease;
 }
-input:focus, textarea:focus { border-color: var(--ac); }
+input:hover, textarea:hover { border-color: var(--bd2); }
+input:focus, textarea:focus {
+  border-color: var(--ac);
+  box-shadow: 0 0 0 3px var(--ac-soft);
+}
 input::placeholder { color: var(--mt); }
 
-/* Code */
-code, pre { font-family: var(--font); }
+/* Inputs that take URLs / hashes need monospace */
+input.mono, .mono { font-family: var(--font-mono); }
+
+/* ── Code ────────────────────────────────────────────────────────── */
+
+code, pre { font-family: var(--font-mono); }
 code {
   background: var(--bg3);
   border: 1px solid var(--bd);
   border-radius: 3px;
   padding: 1px 5px;
   color: var(--ac2);
-  font-size: .9em;
+  font-size: 0.9em;
 }
+
+pre {
+  background: var(--bg2);
+  border: 1px solid var(--bd);
+  border-radius: var(--r-sm);
+  padding: 10px 14px;
+  overflow-x: auto;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* ── Links ───────────────────────────────────────────────────────── */
+
+a {
+  color: var(--ac2);
+  text-decoration: none;
+  transition: color 0.1s ease;
+}
+a:hover { color: var(--ac); text-decoration: underline; }
+
+/* ── Animations ──────────────────────────────────────────────────── */
+
+@keyframes spin    { to { transform: rotate(360deg); } }
+@keyframes fadeIn  { from { opacity: 0; } to { opacity: 1; } }
+@keyframes slideUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes pulse   { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
