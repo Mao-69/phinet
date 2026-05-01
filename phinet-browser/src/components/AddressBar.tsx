@@ -21,16 +21,26 @@ export function AddressBar({ value, loading, isPhinet, onNavigate }: Props) {
   const navigate = () => {
     let url = draft.trim();
     if (!url) return;
-    // Normalise .phinet addresses
+
+    // Normalize .phinet addresses. Accept both 64-hex (current Ed25519
+    // identity-derived) and 40-hex (legacy BLAKE2b) forms.
     const hs = url.replace(/\.phinet$/, "");
-    if (/^[0-9a-fA-F]{40}$/i.test(hs)) {
+    if (/^[0-9a-fA-F]{64}$/i.test(hs) || /^[0-9a-fA-F]{40}$/i.test(hs)) {
       url = `http://${hs.toLowerCase()}.phinet/`;
     } else if (url.startsWith("about:")) {
       // keep as-is
     } else if (!/^[a-z]+:\/\//i.test(url)) {
-      url = url.includes(".") && !url.includes(" ")
-        ? `http://${url}`
-        : `about:home`;
+      // No scheme — decide whether this is a URL or a search query
+      const looksLikeDomain = /^[\w-]+(\.[\w-]+)+(\/.*)?$/.test(url);
+      if (looksLikeDomain) {
+        // Default to https — modern web is HTTPS by default
+        url = `https://${url}`;
+      } else if (url.includes(" ") || !url.includes(".")) {
+        // Search query
+        url = `https://duckduckgo.com/?q=${encodeURIComponent(url)}`;
+      } else {
+        url = `https://${url}`;
+      }
     }
     onNavigate(url);
     setEditing(false);
@@ -42,15 +52,26 @@ export function AddressBar({ value, loading, isPhinet, onNavigate }: Props) {
     if (e.key === "Escape") { setEditing(false); setDraft(value); inputRef.current?.blur(); }
   };
 
-  const iconLabel = isPhinet ? "⬡" : "●";
-  const iconClass = isPhinet ? "phinet" : "clearnet";
+  // Determine security indicator
+  const isHttps = value.startsWith("https://");
+  const isHttp  = value.startsWith("http://") && !isPhinet;
+  let iconClass = "default";
+  let iconLabel = "🔍";
+  if (isPhinet) { iconClass = "phinet";   iconLabel = "⬡"; }
+  else if (isHttps) { iconClass = "clearnet"; iconLabel = "🔒"; }
+  else if (isHttp)  { iconClass = "http";     iconLabel = "⚠"; }
 
   // Display: strip "about:home" → empty placeholder
   const displayVal = !editing && value === "about:home" ? "" : draft;
 
   return (
     <div className="addr-bar-wrap">
-      <span className={`addr-icon ${iconClass}`}>{iconLabel}</span>
+      <span className={`addr-icon ${iconClass}`} title={
+        isPhinet ? "Hidden service — onion-routed"
+        : isHttps ? "Encrypted (HTTPS)"
+        : isHttp  ? "Not encrypted (HTTP)"
+        : "Search or enter address"
+      }>{iconLabel}</span>
 
       <input
         ref={inputRef}
@@ -58,7 +79,7 @@ export function AddressBar({ value, loading, isPhinet, onNavigate }: Props) {
         type="text"
         spellCheck={false}
         autoComplete="off"
-        placeholder="Enter .phinet address or URL…"
+        placeholder="Search the web or enter a .phinet address"
         value={displayVal}
         onChange={e => { setEditing(true); setDraft(e.target.value); }}
         onFocus={e => { setEditing(true); setTimeout(() => e.target.select(), 0); }}

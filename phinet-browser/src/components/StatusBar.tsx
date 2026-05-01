@@ -17,7 +17,16 @@ export function StatusBar({ tab, daemon }: Props) {
   const isPhinet   = tab?.isPhinet ?? false;
   const isHome     = tab?.url === "about:home" || !tab?.url;
   const urlDisplay = isHome ? "" : (tab?.url ?? "");
-  const modeLabel  = isPhinet ? "⬡ ΦNET · anonymous" : "● clearnet";
+
+  const isHttps = !!tab?.url?.startsWith("https://");
+  const isHttp  = !!tab?.url?.startsWith("http://") && !isPhinet;
+
+  // Status indicator label / class
+  let modeLabel  = "Home";
+  let modeClass  = "local";
+  if (isPhinet)      { modeLabel = "⬡ ΦNET · onion-routed"; modeClass = "phinet";   }
+  else if (isHttps)  { modeLabel = "🔒 Secure (HTTPS)";       modeClass = "clearnet"; }
+  else if (isHttp)   { modeLabel = "⚠ Not secure (HTTP)";     modeClass = "http";     }
 
   const doConnect = async () => {
     const addr = peerAddr.trim();
@@ -43,27 +52,27 @@ export function StatusBar({ tab, daemon }: Props) {
       {/* Connect-to-peer popup */}
       {showConnect && (
         <div style={{
-          position: "absolute", bottom: 28, right: 8, zIndex: 200,
-          background: "var(--bg2)", border: "1px solid var(--bd2)",
-          borderRadius: 8, padding: "10px 12px", display: "flex",
-          flexDirection: "column", gap: 6, minWidth: 280,
-          boxShadow: "0 8px 24px rgba(0,0,0,.5)",
+          position: "absolute", bottom: 32, right: 12, zIndex: 200,
+          background: "var(--bg2)", border: "1px solid var(--bd)",
+          borderRadius: 10, padding: "14px 16px", display: "flex",
+          flexDirection: "column", gap: 10, minWidth: 320,
+          boxShadow: "var(--shadow-lg)",
+          animation: "slideUp 0.15s ease",
         }}>
-          <div style={{ fontSize: 11, color: "var(--ac2)", marginBottom: 2 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: "var(--tx)", marginBottom: 2 }}>
             Connect to peer
           </div>
-          <div style={{ display: "flex", gap: 6 }}>
+          <div style={{ display: "flex", gap: 8 }}>
             <input
               autoFocus
               placeholder="host:7700"
               value={peerAddr}
               onChange={e => setPeerAddr(e.target.value)}
               onKeyDown={e => { if (e.key === "Enter") doConnect(); if (e.key === "Escape") setShowConnect(false); }}
-              style={{ flex: 1, fontSize: 11 }}
+              style={{ flex: 1 }}
             />
             <button
               className="primary"
-              style={{ fontSize: 11, padding: "4px 10px" }}
               onClick={doConnect}
               disabled={connecting}
             >
@@ -71,22 +80,24 @@ export function StatusBar({ tab, daemon }: Props) {
             </button>
           </div>
           {connectMsg && (
-            <div style={{ fontSize: 10, color: connectMsg.startsWith("Conn") ? "var(--green)" : "var(--red)" }}>
+            <div style={{
+              fontSize: 12,
+              color: connectMsg.startsWith("Conn") ? "var(--green)" : "var(--red)",
+            }}>
               {connectMsg}
             </div>
           )}
-          <div style={{ fontSize: 10, color: "var(--mt)" }}>
-            Or via CLI:&nbsp; <code>phi status</code> then&nbsp;
-            <code>phinet-daemon --bootstrap host:7700</code>
+          <div style={{ fontSize: 11, color: "var(--mt)", lineHeight: 1.5 }}>
+            Or via CLI: <code>phinet-daemon --bootstrap host:7700</code>
           </div>
         </div>
       )}
 
       <div className="status-bar">
         <span className="status-url">{urlDisplay}</span>
-        <span className="status-sep">·</span>
+        {urlDisplay && <span className="status-sep">·</span>}
 
-        <span className={`status-indicator ${isPhinet ? "phinet" : "clearnet"}`}>
+        <span className={`status-indicator ${modeClass}`}>
           {modeLabel}
         </span>
 
@@ -96,15 +107,16 @@ export function StatusBar({ tab, daemon }: Props) {
           style={{ cursor: daemon.online ? "pointer" : "default" }}
           onClick={() => daemon.online && setShowConnect(v => !v)}
         >
+          <span className="status-daemon-dot" />
           {daemon.online
-            ? `⬡ network · ${daemon.peers} peer${daemon.peers !== 1 ? "s" : ""}${daemon.peers === 0 ? " — click to connect" : ""}`
-            : "○ local only"}
+            ? `${daemon.peers} ${daemon.peers !== 1 ? "peers" : "peer"}${daemon.peers === 0 ? " · click to connect" : ""}`
+            : "Daemon offline"}
         </span>
 
         {daemon.online && daemon.cert_bits && (
           <>
             <span className="status-sep">·</span>
-            <span className="status-indicator" style={{ color: "var(--mt)" }}>
+            <span style={{ color: "var(--mt)", fontSize: 10 }}>
               {daemon.cert_bits}b cert
             </span>
           </>
