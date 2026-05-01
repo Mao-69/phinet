@@ -308,6 +308,96 @@ async fn dispatch(req: &Req, node: &Arc<PhiNode>) -> Resp {
             }
         }
 
+        "auto_circuit" => {
+            // Build a circuit using consensus-weighted path selection.
+            //
+            // Request: {"cmd":"auto_circuit"}
+            //   Optionally provide "consensus_path" pointing at a JSON
+            //   ConsensusDocument file. Otherwise we construct an
+            //   ad-hoc consensus from currently-connected peers (fine
+            //   for a small private network, not what production
+            //   would use).
+            //
+            // The selector picks 3 hops weighted by bandwidth, with
+            // /16 subnet diversity, GUARD/EXIT flag constraints, and
+            // self-exclusion. Returns the constructed circuit ID.
+            use phinet_core::directory::{ConsensusDocument, PeerEntry, PeerFlags};
+            use phinet_core::path_select::{select_path, PathError};
+
+            let consensus = if let Some(path) = req.text.as_deref() {
+                // Operator passed a consensus file path.
+                match std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<ConsensusDocument>(&s).ok())
+                {
+                    Some(c) => c,
+                    None => return Resp::err(
+                        &format!("could not load/parse consensus from {path}")),
+                }
+            } else {
+                // Construct an ad-hoc consensus from connected peers.
+                // Every peer gets STABLE+FAST+GUARD+EXIT+RUNNING+VALID
+                // because in a small private network every peer is
+                // expected to do everything. Bandwidth is set to 1000
+                // for all peers (uniform random selection).
+                let peers = node.peers_snapshot().await;
+                if peers.len() < 3 {
+                    return Resp::err(&format!(
+                        "auto_circuit: need ≥3 connected peers, have {}",
+                        peers.len()));
+                }
+                let entries: Vec<PeerEntry> = peers.iter().map(|p| {
+                    PeerEntry {
+                        node_id_hex:    hex::encode(p.node_id),
+                        host:           p.host.clone(),
+                        port:           p.port,
+                        static_pub_hex: p.static_pub.clone(),
+                        flags: (PeerFlags::STABLE | PeerFlags::FAST
+                                | PeerFlags::GUARD | PeerFlags::EXIT
+                                | PeerFlags::RUNNING | PeerFlags::VALID).bits(),
+                        bandwidth_kbs: 1000,
+                        exit_policy_summary: String::new(),
+                    }
+                }).collect();
+                ConsensusDocument {
+                    network_id: "phinet-local".to_string(),
+                    valid_after: 0,
+                    valid_until: u64::MAX,
+                    peers: entries,
+                    signatures: Vec::new(),
+                }
+            };
+
+            // Exclude our own node_id so we don't pick ourselves.
+            let self_id = hex::encode(node.node_id());
+            // OsRng is Send (unlike thread_rng which has thread-local
+            // state) so the future containing it can cross threads.
+            let mut rng = rand::rngs::OsRng;
+            let path = match select_path(&mut rng, &consensus, &[self_id], None) {
+                Ok(p) => p,
+                Err(PathError::InsufficientRelays(s)) => {
+                    return Resp::err(&format!("path selection: {s}"));
+                }
+            };
+
+            let specs = match path.to_link_specs() {
+                Ok(s) => s,
+                Err(e) => return Resp::err(&format!("link spec conversion: {e}")),
+            };
+            let hop_summary: Vec<String> = path.hops.iter()
+                .map(|h| format!("{}…@{}:{}", &h.node_id_hex[..8], h.host, h.port))
+                .collect();
+
+            let node = Arc::clone(node);
+            match node.build_circuit(specs).await {
+                Ok(cid) => Resp::ok(serde_json::json!({
+                    "circ_id": cid.0,
+                    "hops":    hop_summary,
+                    "method":  "auto_select",
+                })),
+                Err(e) => Resp::err(&format!("auto_circuit build: {e}")),
+            }
+        }
         other => Resp::err(&format!("unknown command: {}", other)),
     }
 }
