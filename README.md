@@ -31,6 +31,7 @@ cargo build --release
 cd phinet-browser
 npm install
 npm run build
+npm install @tauri-apps/api@~2.10.0
 cargo tauri build
 ```
 
