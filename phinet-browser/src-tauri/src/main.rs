@@ -503,6 +503,9 @@ fn main() {
         .register_uri_scheme_protocol("phinet", move |_app, req| {
             let socks = socks_for_proto;
             let url = req.uri().to_string();
+            // Clone for the worker thread; keep `url` available for
+            // logging on the error path.
+            let url_for_thread = url.clone();
             // The WebView decodes the response synchronously, but we
             // need an async runtime to do the SOCKS5 dial + HTTP
             // fetch. Block on a one-shot tokio runtime.
@@ -511,7 +514,7 @@ fn main() {
                     .enable_all()
                     .build()
                     .map_err(|e| format!("rt: {e}"))?;
-                rt.block_on(fetch_phinet_subresource(&url, socks))
+                rt.block_on(fetch_phinet_subresource(&url_for_thread, socks))
             }).join().unwrap_or_else(|_| Err("thread panic".into()));
 
             match body {
