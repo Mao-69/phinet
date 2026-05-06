@@ -102,6 +102,132 @@ async fn run_ctl(node: Arc<PhiNode>, port: u16) -> Result<()> {
     }
 }
 
+/// Serve the cached consensus over plain HTTP/1.1.
+///
+/// **Bind address: 127.0.0.1**. The endpoint is intended to be
+/// fronted by a TLS-terminating reverse proxy (nginx/Caddy/Apache)
+/// that handles the HTTPS cert and forwards to this. We don't bind
+/// 0.0.0.0 because that would publish raw HTTP on the public
+/// internet — operationally legitimate but easy to misconfigure.
+/// If you want public exposure, set up the reverse proxy. If you
+/// want to bypass it, change the bind address yourself; the model
+/// is documented in `phinet-core/src/consensus_fetch.rs`.
+///
+/// Endpoints:
+///   - `GET /consensus.json` → JSON-serialized cached consensus
+///   - `GET /consensus.hash` → hex SHA-256 of canonical consensus bytes
+///                              (cheap diff-check for clients)
+///   - other paths → 404
+///
+/// Returns 503 if no consensus is cached yet (authority hasn't run
+/// merge-votes). Clients should retry later.
+async fn serve_consensus_http(node: Arc<PhiNode>, port: u16) -> Result<()> {
+    let addr = format!("127.0.0.1:{}", port);
+    let srv  = TcpListener::bind(&addr).await
+        .with_context(|| format!("bind consensus HTTP on {}", addr))?;
+    info!("Consensus HTTP on {}", addr);
+
+    loop {
+        let (conn, _) = srv.accept().await?;
+        let n = Arc::clone(&node);
+        tokio::spawn(async move {
+            if let Err(e) = handle_consensus_http(conn, n).await {
+                tracing::debug!("consensus http: {}", e);
+            }
+        });
+    }
+}
+
+async fn handle_consensus_http(stream: TcpStream, node: Arc<PhiNode>) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let (rd, mut wr) = stream.into_split();
+    let mut reader = BufReader::new(rd);
+
+    // Parse request line: METHOD PATH HTTP/1.1
+    let mut req_line = String::new();
+    reader.read_line(&mut req_line).await?;
+    let parts: Vec<&str> = req_line.split_whitespace().collect();
+    if parts.len() < 2 {
+        let _ = wr.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n").await;
+        return Ok(());
+    }
+    let method = parts[0];
+    let path   = parts[1];
+
+    // Drain headers (we don't care about them but must consume to
+    // avoid a half-closed read leaving bytes in the socket).
+    loop {
+        let mut h = String::new();
+        let n = reader.read_line(&mut h).await?;
+        if n == 0 { break; }
+        if h.trim_end_matches(&['\r', '\n'][..]).is_empty() { break; }
+    }
+
+    if method != "GET" && method != "HEAD" {
+        let _ = wr.write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\
+                              Allow: GET, HEAD\r\n\
+                              Content-Length: 0\r\n\r\n").await;
+        return Ok(());
+    }
+
+    let cached = node.cached_consensus.read().await;
+    let consensus = match cached.as_ref() {
+        Some(c) => c.clone(),
+        None => {
+            let _ = wr.write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\n\
+                  Content-Type: text/plain\r\n\
+                  Content-Length: 31\r\n\r\n\
+                  no consensus cached on this host"
+            ).await;
+            return Ok(());
+        }
+    };
+    drop(cached);
+
+    match path {
+        "/consensus.json" => {
+            let body = serde_json::to_vec_pretty(&consensus)?;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 Cache-Control: max-age=300\r\n\
+                 Connection: close\r\n\r\n",
+                body.len());
+            wr.write_all(head.as_bytes()).await?;
+            if method == "GET" {
+                wr.write_all(&body).await?;
+            }
+        }
+        "/consensus.hash" => {
+            let hash = phinet_core::directory::consensus_hash(&consensus);
+            let body = format!("{}\n", hex::encode(hash));
+            let head = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: text/plain\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                body.len());
+            wr.write_all(head.as_bytes()).await?;
+            if method == "GET" {
+                wr.write_all(body.as_bytes()).await?;
+            }
+        }
+        _ => {
+            let _ = wr.write_all(
+                b"HTTP/1.1 404 Not Found\r\n\
+                  Content-Type: text/plain\r\n\
+                  Content-Length: 9\r\n\r\n\
+                  not found"
+            ).await;
+        }
+    }
+    let _ = wr.shutdown().await;
+    Ok(())
+}
+
 async fn handle_ctl(stream: TcpStream, node: Arc<PhiNode>) -> Result<()> {
     let (rd, mut wr) = stream.into_split();
     let mut lines = BufReader::new(rd).lines();
@@ -398,6 +524,229 @@ async fn dispatch(req: &Req, node: &Arc<PhiNode>) -> Resp {
                 Err(e) => Resp::err(&format!("auto_circuit build: {e}")),
             }
         }
+
+        "bw_measure" => {
+            // Measure throughput through a target relay by building
+            // a 2-hop circuit (target → helper) and timing how fast
+            // bytes flow back. Used by the bandwidth scanner.
+            //
+            // Request:
+            //   {"cmd":"bw_measure",
+            //    "hs_id":"<target relay node_id_hex>",
+            //    "text":"<helper relay node_id_hex>",   // optional
+            //    "method":"<bytes>" }                   // optional, default 1MB
+            //
+            // The "method" field carries the payload byte count
+            // (sloppy but the Req struct is fixed and we don't have
+            // a free numeric field).
+            //
+            // Returns: { bw_kbs, rtt_ms, bytes_received, success }
+            //
+            // Caveat: this needs at least one helper relay connected
+            // to the target. In a small network this is the case
+            // because everyone connects to everyone; in production
+            // the scanner would specify the helper explicitly.
+            use phinet_core::circuit::LinkSpec;
+
+            let target_hex = match req.hs_id.as_deref() {
+                Some(s) => s,
+                None    => return Resp::err("bw_measure: missing hs_id (target node_id)"),
+            };
+            let target_id = match hex::decode(target_hex) {
+                Ok(v) if v.len() == 32 => {
+                    let mut a = [0u8; 32]; a.copy_from_slice(&v); a
+                }
+                _ => return Resp::err("bw_measure: bad target node_id_hex"),
+            };
+
+            let payload_bytes: usize = req.method.as_deref()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1024 * 1024);
+
+            let peers = node.peers_snapshot().await;
+            let target_peer = peers.iter().find(|p| p.node_id == target_id);
+            let target_peer = match target_peer {
+                Some(p) => p,
+                None    => return Resp::err(&format!(
+                    "bw_measure: target {} is not in peer table — connect to it first",
+                    &target_hex[..16])),
+            };
+
+            // Pick a helper: either explicit from req.text, or the
+            // first peer that isn't us and isn't the target.
+            let self_id = node.node_id();
+            let helper_peer = if let Some(htxt) = req.text.as_deref() {
+                let h = match hex::decode(htxt) {
+                    Ok(v) if v.len() == 32 => {
+                        let mut a = [0u8; 32]; a.copy_from_slice(&v); a
+                    }
+                    _ => return Resp::err("bw_measure: bad helper node_id_hex"),
+                };
+                peers.iter().find(|p| p.node_id == h)
+            } else {
+                peers.iter().find(|p|
+                    p.node_id != self_id && p.node_id != target_id)
+            };
+            let helper_peer = match helper_peer {
+                Some(p) => p,
+                None    => return Resp::err(
+                    "bw_measure: no helper available (need ≥2 connected peers)"),
+            };
+
+            let target_pub = match hex::decode(&target_peer.static_pub) {
+                Ok(v) if v.len() == 32 => {
+                    let mut a = [0u8; 32]; a.copy_from_slice(&v); a
+                }
+                _ => return Resp::err("bw_measure: target static_pub bad hex"),
+            };
+            let helper_pub = match hex::decode(&helper_peer.static_pub) {
+                Ok(v) if v.len() == 32 => {
+                    let mut a = [0u8; 32]; a.copy_from_slice(&v); a
+                }
+                _ => return Resp::err("bw_measure: helper static_pub bad hex"),
+            };
+
+            let specs = vec![
+                LinkSpec {
+                    host:       target_peer.host.clone(),
+                    port:       target_peer.port,
+                    node_id:    target_id,
+                    static_pub: target_pub,
+                },
+                LinkSpec {
+                    host:       helper_peer.host.clone(),
+                    port:       helper_peer.port,
+                    node_id:    helper_peer.node_id,
+                    static_pub: helper_pub,
+                },
+            ];
+
+            let t_build_start = std::time::Instant::now();
+            let cid = match Arc::clone(node).build_circuit(specs).await {
+                Ok(c) => c,
+                Err(e) => return Resp::err(&format!("bw_measure: circuit build: {e}")),
+            };
+            let build_ms = t_build_start.elapsed().as_millis() as u32;
+
+            // Open a bw-test:<N> stream to the helper (last hop).
+            // The helper's BEGIN handler intercepts the sentinel
+            // target and emits N pseudorandom bytes locally — no
+            // network egress, no exit-policy involvement. We time
+            // first-byte and total arrival to compute throughput.
+            let target_str = format!("bw-test:{}", payload_bytes);
+            let (stream_id, mut rx, ready) =
+                match node.stream_open(cid, &target_str).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let _ = node.destroy_circuit(cid).await;
+                        return Resp::err(&format!("bw_measure: stream_open: {e}"));
+                    }
+                };
+
+            // Wait for CONNECTED to fire so the timer doesn't include
+            // RELAY_BEGIN dispatch latency. Bound the wait.
+            if let Err(_) = tokio::time::timeout(
+                std::time::Duration::from_secs(15), ready
+            ).await {
+                let _ = node.stream_close(cid, stream_id,
+                    phinet_core::stream::EndReason::Internal).await;
+                let _ = node.destroy_circuit(cid).await;
+                return Resp::err("bw_measure: stream did not reach Open within 15s");
+            }
+
+            let t_first_byte: Option<std::time::Instant>;
+            let mut received: usize = 0;
+            let t_recv_start = std::time::Instant::now();
+
+            // First byte: wait up to 30s
+            let first_chunk = tokio::time::timeout(
+                std::time::Duration::from_secs(30), rx.recv()
+            ).await;
+            t_first_byte = Some(std::time::Instant::now());
+            match first_chunk {
+                Ok(Some(buf)) => received += buf.len(),
+                Ok(None) => {
+                    let _ = node.destroy_circuit(cid).await;
+                    return Resp::err("bw_measure: stream closed before any data");
+                }
+                Err(_) => {
+                    let _ = node.destroy_circuit(cid).await;
+                    return Resp::err("bw_measure: no data within 30s of stream open");
+                }
+            }
+
+            // Drain remaining chunks until EOF or full payload.
+            while received < payload_bytes {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(60), rx.recv()
+                ).await {
+                    Ok(Some(buf)) => received += buf.len(),
+                    Ok(None) => break, // helper closed stream
+                    Err(_)   => break, // timeout — accept what we got
+                }
+            }
+
+            let t_done = std::time::Instant::now();
+            let transfer_ms = t_first_byte
+                .map(|t| t_done.duration_since(t).as_millis().max(1) as u64)
+                .unwrap_or(1);
+            let total_ms = t_recv_start.elapsed().as_millis().max(1) as u64;
+
+            // bw_kbs = bytes / (transfer_secs) / 1024 (kibibytes).
+            // We use the post-first-byte window so circuit-build and
+            // queue-warmup don't depress the number; it's the
+            // steady-state throughput.
+            let bw_kbs = ((received as u64) * 1000 / transfer_ms / 1024) as u32;
+
+            // rtt_ms reports the time to first byte after stream
+            // open: this is the round-trip across the 2 hops, a
+            // useful auxiliary signal for "is this relay overloaded?"
+            let rtt_ms = t_first_byte
+                .map(|t| t.duration_since(t_recv_start).as_millis() as u32)
+                .unwrap_or(0);
+
+            // Tear down stream and circuit
+            let _ = node.stream_close(cid, stream_id,
+                phinet_core::stream::EndReason::Done).await;
+            let _ = node.destroy_circuit(cid).await;
+
+            Resp::ok(serde_json::json!({
+                "bw_kbs":         bw_kbs,
+                "rtt_ms":         rtt_ms,
+                "bytes_received": received,
+                "bytes_requested": payload_bytes,
+                "transfer_ms":    transfer_ms,
+                "total_ms":       total_ms,
+                "build_ms":       build_ms,
+                "success":        received > 0,
+                "circuit_method": "2hop_target_then_helper_bw_test",
+            }))
+        }
+
+        "consensus_load" => {
+            // Load a consensus document from disk and install it
+            // into cached_consensus after verification.
+            //
+            // Request: {"cmd":"consensus_load","text":"/path/to/consensus.json"}
+            let path = match req.text.as_deref() {
+                Some(p) => p,
+                None    => return Resp::err("consensus_load: missing text (path)"),
+            };
+            let bytes = match std::fs::read_to_string(path) {
+                Ok(b) => b,
+                Err(e) => return Resp::err(&format!("read {}: {}", path, e)),
+            };
+            let consensus: phinet_core::directory::ConsensusDocument =
+                match serde_json::from_str(&bytes) {
+                    Ok(c) => c,
+                    Err(e) => return Resp::err(&format!("parse: {}", e)),
+                };
+            match phinet_core::consensus_fetch::install_consensus(node, consensus).await {
+                Ok(updated) => Resp::ok(serde_json::json!({"updated": updated})),
+                Err(e)      => Resp::err(&e),
+            }
+        }
+
         other => Resp::err(&format!("unknown command: {}", other)),
     }
 }
@@ -411,10 +760,15 @@ async fn main() -> Result<()> {
     let mut host          = "0.0.0.0".to_string();
     let mut bootstrap     = Vec::<(String, u16)>::new();
     let mut cert_bits     = CertBits::B256;
-    let mut ctl_port      = 7799u16;
+    let mut ctl_port       = 7799u16;
+    let mut consensus_port: Option<u16> = None;
     let mut reset         = false;
     let mut _high_sec      = false;
     let mut verbose       = false;
+    let mut client_only   = false;
+    let mut trusted_auths = Vec::<[u8; 32]>::new();
+    let mut consensus_url: Option<String> = None;
+    let mut consensus_path: Option<String> = None;
     let mut i             = 1usize;
 
     while i < args.len() {
@@ -422,6 +776,7 @@ async fn main() -> Result<()> {
             "--port"            => { port     = args.get(i+1).and_then(|s| s.parse().ok()).unwrap_or(7700); i += 1; }
             "--host"            => { host     = args.get(i+1).cloned().unwrap_or_else(|| "0.0.0.0".into()); i += 1; }
             "--ctl-port"        => { ctl_port = args.get(i+1).and_then(|s| s.parse().ok()).unwrap_or(7799); i += 1; }
+            "--consensus-port"  => { consensus_port = args.get(i+1).and_then(|s| s.parse().ok()); i += 1; }
             "--cert-bits"       => {
                 cert_bits = match args.get(i+1).map(|s| s.as_str()) {
                     Some("512")  => CertBits::B512,
@@ -460,6 +815,58 @@ async fn main() -> Result<()> {
             "--reset-identity"  => reset    = true,
             "--high-security"   => _high_sec = true,
             "--verbose" | "-v"  => verbose  = true,
+
+            // Client-only mode: don't bind a listener. Outbound
+            // circuits and HS fetch still work; this node just
+            // doesn't accept inbound connections.
+            "--client-only"     => client_only = true,
+
+            // Add a trusted directory authority by hex-encoded
+            // Ed25519 public key (32 bytes = 64 hex chars). Repeat
+            // the flag to add multiple. Without these, consensus
+            // verification will reject every consensus.
+            "--trusted-authority" => {
+                if let Some(s) = args.get(i+1) {
+                    match hex::decode(s.trim()) {
+                        Ok(v) if v.len() == 32 => {
+                            let mut arr = [0u8; 32];
+                            arr.copy_from_slice(&v);
+                            trusted_auths.push(arr);
+                        }
+                        _ => eprintln!("Warning: --trusted-authority {} is not 32-byte hex; ignored", s),
+                    }
+                } else {
+                    eprintln!("Usage: --trusted-authority <64-hex-char Ed25519 pubkey>");
+                }
+                i += 1;
+            }
+
+            // URL of an HTTPS-served consensus document. The daemon
+            // periodically fetches this, verifies the signatures
+            // against --trusted-authority, and uses it for path
+            // selection. Mutually exclusive with --consensus-path.
+            "--consensus-url" => {
+                if let Some(s) = args.get(i+1) {
+                    consensus_url = Some(s.clone());
+                } else {
+                    eprintln!("Usage: --consensus-url <https://auth.example.com/consensus.json>");
+                }
+                i += 1;
+            }
+
+            // Local file path to a consensus document. Useful for
+            // testnets where the operator places the consensus on
+            // disk rather than serving it over HTTPS. Mutually
+            // exclusive with --consensus-url.
+            "--consensus-path" => {
+                if let Some(s) = args.get(i+1) {
+                    consensus_path = Some(s.clone());
+                } else {
+                    eprintln!("Usage: --consensus-path </path/to/consensus.json>");
+                }
+                i += 1;
+            }
+
             _                   => {}
         }
         i += 1;
@@ -472,6 +879,41 @@ async fn main() -> Result<()> {
     let cert  = load_or_create(cert_bits, reset)?;
     let store = Arc::new(SiteStore::new());
     let node  = PhiNode::new(&host, port, cert, store);
+
+    // Apply --client-only flag.
+    if client_only {
+        node.client_only.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Populate trusted directory authorities. Without at least one,
+    // consensus verification rejects every consensus, which means
+    // path selection has no consensus to consult.
+    if !trusted_auths.is_empty() {
+        let mut guard = node.trusted_authorities.write().await;
+        *guard = trusted_auths.clone();
+        info!("Trusted authorities: {}", trusted_auths.len());
+    } else if client_only {
+        warn!("--client-only without --trusted-authority; consensus verification will fail");
+    }
+
+    // Mutual exclusion between consensus-url and consensus-path.
+    if consensus_url.is_some() && consensus_path.is_some() {
+        anyhow::bail!("--consensus-url and --consensus-path are mutually exclusive");
+    }
+
+    // Background loop: periodically refresh the consensus.
+    if let Some(url) = consensus_url.clone() {
+        let n = Arc::clone(&node);
+        tokio::spawn(async move {
+            phinet_core::consensus_fetch::refresh_loop_url(n, url).await;
+        });
+    } else if let Some(path) = consensus_path.clone() {
+        let n = Arc::clone(&node);
+        tokio::spawn(async move {
+            phinet_core::consensus_fetch::refresh_loop_path(n, path).await;
+        });
+    }
+
     // high_security cannot be set after Arc creation — use a wrapper or re-init
     // For now, high_security is false by default (can be toggled via ctl later)
 
@@ -484,6 +926,23 @@ async fn main() -> Result<()> {
             warn!("Control: {}", e);
         }
     });
+
+    // Consensus HTTP endpoint (default ctl_port + 1 = 7800).
+    // Serves the cached_consensus as JSON to anyone who GETs
+    // /consensus.json. This is the *publish* side — clients fetching
+    // from a URL hit either this directly or (recommended) hit a
+    // TLS-terminating reverse proxy that forwards here.
+    //
+    // Skip in client-only mode: a client doesn't publish a consensus.
+    if !client_only {
+        let cons_node = Arc::clone(&node);
+        let cons_port = consensus_port.unwrap_or_else(|| ctl_port.wrapping_add(1));
+        tokio::spawn(async move {
+            if let Err(e) = serve_consensus_http(cons_node, cons_port).await {
+                warn!("Consensus serve: {}", e);
+            }
+        });
+    }
 
     // Bootstrap
     if !bootstrap.is_empty() {
