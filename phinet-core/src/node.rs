@@ -168,7 +168,31 @@ pub struct PhiNode {
     /// in on isn't visible here (the obfs is on the wire below us).
     /// Replacing the listener with `transport.listen()` is a
     /// straightforward extension when needed.
+    /// connections from many transports, and which one a peer dialed
+    /// in on isn't visible here (the obfs is on the wire below us).
+    /// Replacing the listener with `transport.listen()` is a
+    /// straightforward extension when needed.
     pub transport: Arc<dyn crate::transport::Transport>,
+
+    /// Client-only mode: this node consumes the network but doesn't
+    /// participate as a relay. In this mode the accept loop in
+    /// `run()` doesn't bind a listener at all, so no one can dial
+    /// in. Outbound circuit-build still works.
+    ///
+    /// Default: false (participate as a relay).
+    pub client_only: std::sync::atomic::AtomicBool,
+
+    /// Trusted directory-authority Ed25519 public keys. Used by
+    /// `verify_consensus` to decide which signatures count toward
+    /// the threshold. Empty by default (operator must populate
+    /// either via daemon flags or by loading from a trust file).
+    pub trusted_authorities: tokio::sync::RwLock<Vec<[u8; 32]>>,
+
+    /// Most recently fetched-and-verified consensus document. Set
+    /// by `consensus_fetch_loop` (or a manual `consensus_load`
+    /// control command). Path selection consults this for
+    /// authoritative bandwidth weights and flag info.
+    pub cached_consensus: tokio::sync::RwLock<Option<crate::directory::ConsensusDocument>>,
 }
 
 impl PhiNode {
@@ -235,6 +259,9 @@ impl PhiNode {
             shutdown:      Arc::new(tokio::sync::Notify::new()),
             shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             transport: Arc::new(crate::transport::PlainTcp),
+            client_only:         std::sync::atomic::AtomicBool::new(false),
+            trusted_authorities: tokio::sync::RwLock::new(Vec::new()),
+            cached_consensus:    tokio::sync::RwLock::new(None),
         })
     }
 
@@ -265,10 +292,23 @@ impl PhiNode {
     // ── Server ────────────────────────────────────────────────────────
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        let addr     = format!("{}:{}", self.host, self.port);
-        let listener = TcpListener::bind(&addr).await?;
-        info!("ΦNET node listening on {}", addr);
-        info!("  node_id = {}…", &self.node_id_hex()[..16]);
+        let client_only = self.client_only.load(std::sync::atomic::Ordering::Relaxed);
+        let addr        = format!("{}:{}", self.host, self.port);
+
+        // In client-only mode we don't bind a listener — the node
+        // doesn't accept inbound connections. Outbound circuit
+        // construction (build_circuit, connect, hs_fetch) all still
+        // work because they go through the transport's dial path.
+        let listener: Option<TcpListener> = if client_only {
+            info!("ΦNET node in client-only mode (no listener)");
+            info!("  node_id = {}…", &self.node_id_hex()[..16]);
+            None
+        } else {
+            let l = TcpListener::bind(&addr).await?;
+            info!("ΦNET node listening on {}", addr);
+            info!("  node_id = {}…", &self.node_id_hex()[..16]);
+            Some(l)
+        };
 
         // Background tasks
         {
@@ -325,18 +365,31 @@ impl PhiNode {
         loop {
             // Select on accept vs shutdown so shutdown() causes a
             // clean return rather than an orphaned accept loop.
-            tokio::select! {
-                accept_result = listener.accept() => {
-                    let (stream, addr) = accept_result?;
-                    let node = Arc::clone(&self);
-                    tokio::spawn(async move {
-                        if let Err(e) = node.handle_incoming(stream, addr).await {
-                            debug!("incoming {}: {}", addr, e);
+            // In client-only mode `listener` is None and we just
+            // wait on shutdown — background tasks (consensus
+            // refresh, guard rotation, etc) keep running.
+            match &listener {
+                Some(l) => {
+                    tokio::select! {
+                        accept_result = l.accept() => {
+                            let (stream, addr) = accept_result?;
+                            let node = Arc::clone(&self);
+                            tokio::spawn(async move {
+                                if let Err(e) = node.handle_incoming(stream, addr).await {
+                                    debug!("incoming {}: {}", addr, e);
+                                }
+                            });
                         }
-                    });
+                        _ = self.shutdown.notified() => {
+                            info!("ΦNET node on {} shutting down", addr);
+                            return Ok(());
+                        }
+                    }
                 }
-                _ = self.shutdown.notified() => {
-                    info!("ΦNET node on {} shutting down", addr);
+                None => {
+                    // Client-only: no listener. Just wait for shutdown.
+                    self.shutdown.notified().await;
+                    info!("ΦNET client shutting down");
                     return Ok(());
                 }
             }
@@ -1256,6 +1309,30 @@ impl PhiNode {
             }
         };
 
+        // ── bw-test: intercept ────────────────────────────────────
+        // Sentinel target used by the bandwidth scanner. Format:
+        // "bw-test:<bytes>" e.g. "bw-test:1048576". The exit relay
+        // generates that many bytes *locally* (no network egress)
+        // and streams them back through the circuit. This produces
+        // a clean throughput measurement of the circuit itself —
+        // dominated by the slowest hop, by design — without
+        // depending on an external server.
+        //
+        // Why this is safe to expose unconditionally:
+        //   - The bytes generated are pseudorandom from a per-stream
+        //     keyed PRF; no information about the relay leaks
+        //   - The size is capped at MAX_BW_TEST_BYTES so a malicious
+        //     client can't request 1 TB and OOM the relay
+        //   - Generation is local — the exit policy doesn't need to
+        //     evaluate it. Even non-EXIT relays can serve bw-test.
+        if let Some(rest) = target.strip_prefix("bw-test:") {
+            let bytes: usize = rest.parse().unwrap_or(0);
+            const MAX_BW_TEST_BYTES: usize = 4 * 1024 * 1024;  // 4 MB cap
+            let bytes = bytes.min(MAX_BW_TEST_BYTES);
+            self.serve_bw_test(from_peer, cid, stream_id, bytes).await;
+            return;
+        }
+
         // Policy: pre-resolve check for IP literals + port blocklist.
         if self.exit_policy.read().unwrap().check_pre_resolve(&target) ==
             crate::exit_policy::Decision::Reject
@@ -1381,6 +1458,115 @@ impl PhiNode {
             }
             // Clean up writer entry on exit
             node.exit_writers.write().await.remove(&(cid, stream_id));
+        });
+    }
+
+    /// Serve a bw-test stream: emit `bytes` of pseudorandom data
+    /// back through the circuit. Mirrors the structure of the
+    /// regular exit-stream forward path (CONNECTED reply, then DATA
+    /// chunks honoring circuit-window flow control), but the bytes
+    /// come from a local PRF instead of a TCP socket.
+    ///
+    /// The bytes are pseudorandom (chacha-style stream from a
+    /// per-stream key) rather than zeros so the throughput
+    /// measurement isn't artificially boosted by compression
+    /// anywhere in the path. It's *not* secret-quality randomness;
+    /// callers should treat the data as "filler that happens to
+    /// look like noise."
+    async fn serve_bw_test(
+        self: Arc<Self>,
+        from_peer: [u8; 32],
+        cid: crate::circuit::CircuitId,
+        stream_id: u16,
+        bytes: usize,
+    ) {
+        // Register stream so DATA cells get demuxed correctly even
+        // if the client sends one (we don't expect them to but the
+        // circuit machinery wants the registration).
+        let streams = {
+            let mgr = self.circuits.read().await;
+            mgr.relays.get(&(from_peer, cid))
+                .map(|rc| Arc::clone(&rc.exit_streams))
+        };
+        let Some(streams) = streams else {
+            debug!("bw-test: relay circuit vanished");
+            return;
+        };
+        let _rx = streams.accept_stream(stream_id, "bw-test".into()).await;
+
+        // Reply CONNECTED upstream so the client's stream transitions
+        // from Connecting → Open and the ready-oneshot fires.
+        self.send_exit_relay(
+            from_peer, cid, crate::circuit::RelayCommand::Connected,
+            stream_id, Vec::new(),
+        ).await;
+
+        // Spawn a generator task: emits chunks of pseudorandom data
+        // until `bytes` are sent, then closes the stream cleanly.
+        let node = Arc::clone(&self);
+        tokio::spawn(async move {
+            // Per-stream PRF state. We use a simple xorshift64 seeded
+            // from (stream_id, cid bits, current time) — fine for
+            // throughput measurement, not a cryptographic primitive.
+            let seed = (stream_id as u64).wrapping_mul(0x9E3779B97F4A7C15)
+                ^ (cid.0 as u64).wrapping_mul(0xBF58476D1CE4E5B9)
+                ^ std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+            let mut state = if seed == 0 { 1 } else { seed };
+
+            let mut sent = 0usize;
+            let chunk_size = crate::circuit::RELAY_DATA_MAX;
+
+            while sent < bytes {
+                let want = (bytes - sent).min(chunk_size);
+                let mut buf = vec![0u8; want];
+                // xorshift64 fill
+                for i in 0..want {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    buf[i] = state as u8;
+                }
+
+                // Honor circuit window — same backpressure pattern as
+                // the TCP forwarder. If the client doesn't drain, we
+                // block here and the measurement reflects that
+                // (correctly slow throughput).
+                loop {
+                    let ok = {
+                        let mut mgr = node.circuits.write().await;
+                        mgr.relays.get_mut(&(from_peer, cid))
+                            .map(|rc| rc.try_consume_circ_window())
+                    };
+                    match ok {
+                        Some(Ok(())) => break,
+                        Some(Err(_)) => {
+                            tokio::time::sleep(
+                                std::time::Duration::from_millis(10)
+                            ).await;
+                        }
+                        None => {
+                            // Circuit destroyed; stop generating
+                            return;
+                        }
+                    }
+                }
+
+                node.send_exit_relay(
+                    from_peer, cid,
+                    crate::circuit::RelayCommand::Data,
+                    stream_id, buf,
+                ).await;
+
+                sent += want;
+            }
+
+            // All bytes sent; close stream cleanly so the client knows
+            // we're done and can compute the final throughput.
+            node.send_exit_end(from_peer, cid, stream_id,
+                crate::stream::EndReason::Done).await;
         });
     }
 

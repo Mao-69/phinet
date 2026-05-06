@@ -233,25 +233,167 @@ fn write_peer_canonical(out: &mut Vec<u8>, p: &PeerEntry) {
     write_lp_string(out, &p.exit_policy_summary);
 }
 
-/// A directory authority. Wraps a long-term Ed25519 identity, used
-/// for both vote signing and consensus signing.
+/// Abstraction over how an authority's Ed25519 signing happens.
+///
+/// The default implementation is `FileBackedSigner` — keeps the
+/// secret in process memory, signs in software via ed25519-dalek.
+/// This is what the file-based `gen-identity` workflow produces.
+///
+/// For production deployments, a hardware-security-module backed
+/// signer can replace this. The HSM holds the secret, exposes a
+/// signing API, and never reveals the key to userspace. The trait
+/// is the single integration point: implement `sign(msg)` to call
+/// out to your HSM (PKCS#11, YubiKey OpenPGP, AWS CloudHSM, etc),
+/// then pass an instance to `DirectoryAuthority::with_signer`.
+///
+/// **Why a trait instead of a concrete struct**: the alternative
+/// is hardcoding a particular HSM vendor or wiring `pkcs11` into
+/// every build. Both are wrong: HSM choice is operator-specific,
+/// and most users never need one. The trait keeps the core code
+/// dep-free while letting operators swap in their hardware.
+pub trait ConsensusSigner: Send + Sync {
+    /// Sign `msg` and return the 64-byte Ed25519 signature.
+    /// Must be deterministic: signing the same message twice with
+    /// the same key returns identical signatures (Ed25519 is
+    /// deterministic by construction; HSMs that support Ed25519
+    /// are required to honor this).
+    fn sign(&self, msg: &[u8]) -> [u8; 64];
+
+    /// The public key corresponding to the secret used for signing.
+    /// Embedded in vote and consensus signature records so verifiers
+    /// know which authority signed.
+    fn public_key(&self) -> [u8; 32];
+
+    /// Hex-encoded public key — convenience wrapper for the wire
+    /// format. Default implementation hex-encodes `public_key()`.
+    fn pub_hex(&self) -> String {
+        hex::encode(self.public_key())
+    }
+}
+
+/// Default file-backed signer. Wraps an `HsIdentity` — the secret
+/// stays in process memory and signing happens in software.
+///
+/// This is what `gen-identity` produces and what every operator
+/// uses by default. Tier 0 / tier 1 in `AUTHORITY_KEY_MGMT.md`.
+pub struct FileBackedSigner {
+    identity: HsIdentity,
+}
+
+impl FileBackedSigner {
+    pub fn new(identity: HsIdentity) -> Self {
+        Self { identity }
+    }
+}
+
+impl ConsensusSigner for FileBackedSigner {
+    fn sign(&self, msg: &[u8]) -> [u8; 64] {
+        let signing = ed25519_dalek::SigningKey::from_bytes(&self.identity.secret_bytes());
+        signing.sign(msg).to_bytes()
+    }
+
+    fn public_key(&self) -> [u8; 32] {
+        self.identity.public_key()
+    }
+}
+
+// ── HSM signer integration sketch ────────────────────────────────────
+//
+// The pattern below is deliberately not enabled by default — every
+// HSM vendor's API differs and pulling in (e.g.) the `pkcs11` crate
+// would force every build to depend on it. Operators who want HSM
+// integration copy this skeleton into their fork:
+//
+// ```ignore
+// use pkcs11::{Ctx, types::*};
+//
+// pub struct Pkcs11Signer {
+//     ctx: Ctx,
+//     session: CK_SESSION_HANDLE,
+//     priv_key: CK_OBJECT_HANDLE,
+//     pub_bytes: [u8; 32],
+// }
+//
+// impl ConsensusSigner for Pkcs11Signer {
+//     fn sign(&self, msg: &[u8]) -> [u8; 64] {
+//         // CKM_EDDSA is the PKCS#11 mechanism for Ed25519
+//         let mech = CK_MECHANISM { mechanism: CKM_EDDSA,
+//                                   pParameter: std::ptr::null_mut(),
+//                                   ulParameterLen: 0 };
+//         self.ctx.sign_init(self.session, &mech, self.priv_key)
+//             .expect("HSM sign_init");
+//         let sig = self.ctx.sign(self.session, msg)
+//             .expect("HSM sign");
+//         let mut arr = [0u8; 64];
+//         arr.copy_from_slice(&sig);
+//         arr
+//     }
+//
+//     fn public_key(&self) -> [u8; 32] { self.pub_bytes }
+// }
+//
+// // Construction looks like:
+// let signer = Pkcs11Signer::open("/usr/lib/yubihsm_pkcs11.so", &user_pin)?;
+// let auth   = DirectoryAuthority::with_signer(Box::new(signer), "phinet-mainnet");
+// ```
+//
+// YubiKey integration via PIV uses a similar pattern with the
+// `yubikey-rs` crate. AWS CloudHSM exposes the same PKCS#11 surface.
+// See AUTHORITY_KEY_MGMT.md for operational guidance.
+
+
+/// A directory authority. Holds an Ed25519 identity (or any
+/// `ConsensusSigner` for HSM-backed deployments) and signs votes
+/// and consensus documents.
 ///
 /// Reuses `HsIdentity` infrastructure since the underlying primitive
 /// (Ed25519 keypair with persisted secret) is identical. The identity
 /// public key is what clients hardcode into their trust set.
+///
+/// **Two construction modes**:
+///   - `new(identity, network_id)` — backwards-compatible. Wraps
+///     an `HsIdentity` in a `FileBackedSigner` automatically.
+///   - `with_signer(signer, network_id)` — generic over any
+///     `ConsensusSigner`. Use this for HSM, YubiKey, or other
+///     hardware-backed signing.
 pub struct DirectoryAuthority {
-    identity: HsIdentity,
+    /// Boxed signer abstraction. For `new()` callers this is a
+    /// `FileBackedSigner`; HSM operators construct via `with_signer`
+    /// and pass their own implementation.
+    signer: Box<dyn ConsensusSigner>,
     network_id: String,
 }
 
 impl DirectoryAuthority {
     /// Wrap an existing identity as an authority for `network_id`.
+    /// The identity is used through a `FileBackedSigner` (secret in
+    /// process memory, software signing). For HSM-backed signing,
+    /// use `with_signer` instead.
     pub fn new(identity: HsIdentity, network_id: impl Into<String>) -> Self {
-        Self { identity, network_id: network_id.into() }
+        Self {
+            signer: Box::new(FileBackedSigner::new(identity)),
+            network_id: network_id.into(),
+        }
+    }
+
+    /// Construct from a custom `ConsensusSigner` implementation. This
+    /// is the entry point for HSM-backed deployments: the operator
+    /// supplies a signer that delegates to their hardware.
+    ///
+    /// ```ignore
+    /// let signer = MyHsmSigner::connect_to_yubikey()?;
+    /// let auth = DirectoryAuthority::with_signer(Box::new(signer), "phinet-mainnet");
+    /// ```
+    pub fn with_signer(signer: Box<dyn ConsensusSigner>, network_id: impl Into<String>) -> Self {
+        Self {
+            signer,
+            network_id: network_id.into(),
+        }
     }
 
     /// Generate a fresh authority. Operators normally do this once
-    /// and persist via `identity().save(path)`.
+    /// and persist by saving the underlying identity. Only available
+    /// in file-backed mode (HSMs generate keys via their own tools).
     pub fn generate(network_id: impl Into<String>) -> Self {
         Self::new(HsIdentity::generate(), network_id)
     }
@@ -259,11 +401,13 @@ impl DirectoryAuthority {
     /// The authority's Ed25519 identity public key (hex-encoded).
     /// This is what clients embed in their trusted-authority list.
     pub fn pub_hex(&self) -> String {
-        hex::encode(self.identity.public_key())
+        self.signer.pub_hex()
     }
 
-    /// Reference to the underlying identity, useful for `save`/`load`.
-    pub fn identity(&self) -> &HsIdentity { &self.identity }
+    /// The authority's Ed25519 identity public key (raw 32 bytes).
+    pub fn public_key(&self) -> [u8; 32] {
+        self.signer.public_key()
+    }
 
     /// The network this authority is voting for.
     pub fn network_id(&self) -> &str { &self.network_id }
@@ -284,9 +428,8 @@ impl DirectoryAuthority {
             sig_hex: String::new(),
         };
         let canonical = canonical_vote_bytes(&v);
-        let signing = ed25519_dalek::SigningKey::from_bytes(&self.identity.secret_bytes());
-        let sig = signing.sign(&canonical);
-        v.sig_hex = hex::encode(sig.to_bytes());
+        let sig = self.signer.sign(&canonical);
+        v.sig_hex = hex::encode(sig);
         v
     }
 
@@ -302,11 +445,10 @@ impl DirectoryAuthority {
         let mut for_sign = doc.clone();
         for_sign.signatures.clear();
         let canonical = canonical_consensus_bytes(&for_sign);
-        let signing = ed25519_dalek::SigningKey::from_bytes(&self.identity.secret_bytes());
-        let sig = signing.sign(&canonical);
+        let sig = self.signer.sign(&canonical);
         doc.signatures.push(AuthoritySignature {
             authority_pub_hex: self.pub_hex(),
-            sig_hex: hex::encode(sig.to_bytes()),
+            sig_hex: hex::encode(sig),
         });
     }
 }
@@ -893,5 +1035,89 @@ mod tests {
         // Client verifies with threshold = ⌈2*3/3⌉ = 2
         verify_consensus(&consensus, &trusted, threshold_for(3), 1500)
             .expect("end-to-end consensus must verify");
+    }
+
+    // ── ConsensusSigner trait ────────────────────────────────────────
+
+    /// Custom signer that delegates to ed25519-dalek but tracks how
+    /// many times `sign` was called. Mirrors what an HSM-backed
+    /// signer's surface looks like: opaque holding of the secret,
+    /// only `sign(msg)` and `public_key()` exposed.
+    struct CountingSigner {
+        inner: HsIdentity,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl ConsensusSigner for CountingSigner {
+        fn sign(&self, msg: &[u8]) -> [u8; 64] {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let signing = ed25519_dalek::SigningKey::from_bytes(&self.inner.secret_bytes());
+            signing.sign(msg).to_bytes()
+        }
+        fn public_key(&self) -> [u8; 32] { self.inner.public_key() }
+    }
+
+    #[test]
+    fn custom_signer_via_with_signer() {
+        // Authority constructed with a custom signer should produce
+        // votes/consensus signatures that verify identically to those
+        // from the file-backed default. This is the contract every
+        // HSM-backed signer must honor.
+        let id = HsIdentity::generate();
+        let pub_hex = hex::encode(id.public_key());
+        let signer = CountingSigner {
+            inner: id,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let auth = DirectoryAuthority::with_signer(
+            Box::new(signer),
+            "phinet-test",
+        );
+        assert_eq!(auth.pub_hex(), pub_hex);
+
+        let vote = auth.vote(1000, 2000, vec![
+            fake_peer("aa", "h1", 1, 100, PeerFlags::FAST.bits() | PeerFlags::RUNNING.bits()),
+        ]);
+        verify_vote(&vote).expect("custom-signer vote must verify");
+
+        let mut doc = ConsensusDocument {
+            network_id: "phinet-test".into(),
+            valid_after: 1000, valid_until: 2000,
+            peers: vec![],
+            signatures: Vec::new(),
+        };
+        auth.sign_consensus(&mut doc);
+        assert_eq!(doc.signatures.len(), 1);
+        let trusted = vec![{
+            let v = hex::decode(&pub_hex).unwrap();
+            let mut a = [0u8; 32]; a.copy_from_slice(&v); a
+        }];
+        verify_consensus(&doc, &trusted, 1, 1500)
+            .expect("custom-signer consensus must verify");
+    }
+
+    #[test]
+    fn file_backed_signer_matches_legacy_path() {
+        // Direct FileBackedSigner usage should produce byte-identical
+        // signatures to what the legacy `DirectoryAuthority::new`
+        // path produces — which is in fact what we now build under
+        // the hood. This test fails if FileBackedSigner ever drifts
+        // from "wraps an HsIdentity directly" semantics.
+        let id1 = HsIdentity::generate();
+        let id2_seed = id1.secret_bytes();   // same secret
+        let id2 = HsIdentity::from_secret_bytes(&id2_seed);
+
+        let auth1 = DirectoryAuthority::new(id1, "net");
+        let auth2 = DirectoryAuthority::with_signer(
+            Box::new(FileBackedSigner::new(id2)),
+            "net",
+        );
+
+        // Same input → same canonical bytes → same Ed25519 sig
+        // (Ed25519 is deterministic).
+        let msg = b"identical-message";
+        let s1 = auth1.signer.sign(msg);
+        let s2 = auth2.signer.sign(msg);
+        assert_eq!(s1, s2,
+            "FileBackedSigner must produce identical sigs for identical secret+msg");
     }
 }

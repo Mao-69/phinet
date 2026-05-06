@@ -27,6 +27,10 @@ pub mod node;
 pub mod directory;
 pub mod transport;
 pub mod path_select;
+pub mod consensus_fetch;
+pub mod padding;
+pub mod client_auth;
+pub mod vanguards;
 pub mod store;
 pub mod error;
 
