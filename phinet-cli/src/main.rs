@@ -370,6 +370,214 @@ async fn cmd_status(_: &[String]) -> Result<()> {
     Ok(())
 }
 
+// ── Vanguards subcommands ────────────────────────────────────────────
+
+async fn cmd_vanguards_list(_args: &[String]) -> Result<()> {
+    if !daemon_online() { bail!("daemon not running on 127.0.0.1:7799"); }
+    let r = ctl(serde_json::json!({"cmd": "vanguards_list"})).await
+        .ok_or_else(|| anyhow::anyhow!("daemon did not respond"))?;
+    if r["ok"] != true {
+        bail!("vanguards_list: {}", r["error"].as_str().unwrap_or("unknown"));
+    }
+    let entries = r["entries"].as_array().cloned().unwrap_or_default();
+    let active  = r["active_count"].as_u64().unwrap_or(0);
+
+    println!();
+    if entries.is_empty() {
+        println!("  {} no vanguards yet", dim("(empty)"));
+        println!("  {}", dim("vanguards populate automatically on the first build_hs_circuit call"));
+    } else {
+        println!("  {}", bold(&format!("{} entries ({} active)", entries.len(), active)));
+        println!();
+        for e in &entries {
+            let id    = e["node_id_hex"].as_str().unwrap_or("?");
+            let host  = e["host"].as_str().unwrap_or("?");
+            let port  = e["port"].as_u64().unwrap_or(0);
+            let added = e["added_at"].as_u64().unwrap_or(0);
+            let used  = e["last_used"].as_u64().unwrap_or(0);
+            let unreach = e["unreachable_since"].as_u64().unwrap_or(0);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            let age_h = (now.saturating_sub(added)) / 3600;
+            let used_str = if used == 0 {
+                dim("never used")
+            } else {
+                let h = (now.saturating_sub(used)) / 3600;
+                dim(&format!("last used {}h ago", h))
+            };
+            let status = if unreach > 0 { red(" UNREACHABLE") } else { String::new() };
+            println!("  {} {}:{}",
+                cyan(&id[..16]), host, port);
+            println!("    {} added {}h ago, {}{}",
+                dim("•"), age_h, used_str, status);
+        }
+    }
+    println!();
+    Ok(())
+}
+
+async fn cmd_vanguards_forget(args: &[String]) -> Result<()> {
+    let id = args.first()
+        .context("Usage: phi vanguards forget <node_id_hex>")?;
+    if !daemon_online() { bail!("daemon not running"); }
+    let r = ctl(serde_json::json!({
+        "cmd": "vanguards_forget",
+        "node_id_hex": id,
+    })).await.ok_or_else(|| anyhow::anyhow!("daemon did not respond"))?;
+    if r["ok"] == true {
+        println!("  {} marked {} unreachable", green("✓"), &id[..id.len().min(16)]);
+        println!("  {}", dim("entry will be removed from the active set immediately;"));
+        println!("  {}", dim("full removal happens after 24h anti-churn window"));
+    } else {
+        bail!("vanguards_forget: {}", r["error"].as_str().unwrap_or("unknown"));
+    }
+    Ok(())
+}
+
+async fn cmd_vanguards_clear(_args: &[String]) -> Result<()> {
+    if !daemon_online() { bail!("daemon not running"); }
+    let r = ctl(serde_json::json!({"cmd": "vanguards_clear"})).await
+        .ok_or_else(|| anyhow::anyhow!("daemon did not respond"))?;
+    if r["ok"] == true {
+        let n = r["marked"].as_u64().unwrap_or(0);
+        println!("  {} marked {} vanguard(s) unreachable", green("✓"), n);
+        if n > 0 {
+            println!("  {}", dim("entries persist for 24h (anti-churn) but won't be picked"));
+            println!("  {}", dim("new vanguards will populate on next HS circuit build"));
+        }
+    } else {
+        bail!("vanguards_clear: {}", r["error"].as_str().unwrap_or("unknown"));
+    }
+    Ok(())
+}
+
+// ── Hidden-service auth subcommands ──────────────────────────────────
+
+async fn cmd_auth_gen_client(_args: &[String]) -> Result<()> {
+    // Pure local key generation — doesn't need the daemon.
+    // X25519 keypairs are independent of network state; we just
+    // need an OS RNG. Falling back to in-process generation when
+    // the daemon isn't running matches operator expectations
+    // (you should be able to generate a client identity offline,
+    // hand it to a friend, and have them run a node later).
+    let (secret, public) = if daemon_online() {
+        // Prefer the daemon path so the generated key shows up in
+        // any audit logs the daemon keeps.
+        let r = ctl(serde_json::json!({"cmd": "hs_auth_gen_client"})).await
+            .ok_or_else(|| anyhow::anyhow!("daemon did not respond"))?;
+        if r["ok"] != true {
+            bail!("hs_auth_gen_client: {}", r["error"].as_str().unwrap_or("unknown"));
+        }
+        (r["secret_hex"].as_str().unwrap_or("").to_string(),
+         r["public_hex"].as_str().unwrap_or("").to_string())
+    } else {
+        // Local fallback. Same primitives as the daemon would use.
+        use phinet_core::x25519_dalek::{StaticSecret, PublicKey};
+        let sec = StaticSecret::random_from_rng(OsRng);
+        let pubk = PublicKey::from(&sec);
+        (hex::encode(sec.to_bytes()), hex::encode(pubk.as_bytes()))
+    };
+
+    println!();
+    println!("  {} client keypair generated", green("✓"));
+    println!();
+    println!("  {} {}", bold("Secret"), cyan(&secret));
+    println!("    {}", dim("⚠ keep this private — anyone with the secret can reach services that authorized your public key"));
+    println!();
+    println!("  {} {}", bold("Public"), cyan(&public));
+    println!("    {}", dim("share this with HS operators who should grant you access"));
+    println!();
+    println!("  {}", dim("HS operators add the public key to their authorized_clients list"));
+    println!("  {}", dim("when publishing the descriptor, then anyone with the matching"));
+    println!("  {}", dim("secret can decrypt and reach the hidden service."));
+    println!();
+    Ok(())
+}
+
+async fn cmd_auth_add_client(args: &[String]) -> Result<()> {
+    let id_or_name = args.first()
+        .context("Usage: phi auth add-client <hs_id> <client_pub_hex>")?;
+    let pubk = args.get(1)
+        .context("Usage: phi auth add-client <hs_id> <client_pub_hex>")?;
+    let store = SiteStore::new();
+    let hs_id = resolve_id(&store, id_or_name).await?;
+
+    match store.add_authorized_client(&hs_id, pubk).await {
+        Ok(true) => {
+            println!();
+            println!("  {} added authorized client", green("✓"));
+            println!("    Service: {}", cyan(&hs_id));
+            println!("    Client:  {}", cyan(pubk));
+            let total = store.list_authorized_clients(&hs_id).await.len();
+            println!("    {} authorized clients now", dim(&total.to_string()));
+            println!();
+            println!("  {} re-publish the descriptor with `phi register {}`",
+                dim("→"), &hs_id[..hs_id.len().min(16)]);
+            println!("    {} for the change to take effect on the network", dim(""));
+            println!();
+        }
+        Ok(false) => {
+            println!("  {} client already authorized; no change", dim("•"));
+        }
+        Err(e) => bail!("add_authorized_client: {}", e),
+    }
+    Ok(())
+}
+
+async fn cmd_auth_list_clients(args: &[String]) -> Result<()> {
+    let id_or_name = args.first()
+        .context("Usage: phi auth list-clients <hs_id>")?;
+    let store = SiteStore::new();
+    let hs_id = resolve_id(&store, id_or_name).await?;
+
+    let clients = store.list_authorized_clients(&hs_id).await;
+    println!();
+    println!("  {} {}", bold("Service"), cyan(&hs_id));
+    if clients.is_empty() {
+        println!("  {} no authorized clients", dim("(empty)"));
+        println!("  {}", dim("descriptor publishes as public — anyone can resolve"));
+    } else {
+        println!("  {}", bold(&format!("{} authorized client(s):", clients.len())));
+        for (i, p) in clients.iter().enumerate() {
+            println!("    {}. {}", i + 1, cyan(p));
+        }
+        println!();
+        println!("  {}", dim("descriptor publishes with client-auth — only listed clients can resolve"));
+    }
+    println!();
+    Ok(())
+}
+
+async fn cmd_auth_remove_client(args: &[String]) -> Result<()> {
+    let id_or_name = args.first()
+        .context("Usage: phi auth remove-client <hs_id> <client_pub_hex>")?;
+    let pubk = args.get(1)
+        .context("Usage: phi auth remove-client <hs_id> <client_pub_hex>")?;
+    let store = SiteStore::new();
+    let hs_id = resolve_id(&store, id_or_name).await?;
+
+    match store.remove_authorized_client(&hs_id, pubk).await {
+        Ok(true) => {
+            println!();
+            println!("  {} removed authorized client", green("✓"));
+            println!("    Service: {}", cyan(&hs_id));
+            println!("    Client:  {}", cyan(pubk));
+            let total = store.list_authorized_clients(&hs_id).await.len();
+            if total == 0 {
+                println!("  {}", dim("→ descriptor will publish as public on next register"));
+            } else {
+                println!("  {} authorized clients remaining", dim(&total.to_string()));
+            }
+            println!();
+        }
+        Ok(false) => {
+            println!("  {} client was not in the list; no change", dim("•"));
+        }
+        Err(e) => bail!("remove_authorized_client: {}", e),
+    }
+    Ok(())
+}
+
 // ── Entry point ───────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -402,6 +610,23 @@ async fn main() -> Result<()> {
                 _ => { eprintln!("Usage: phi circuit status|build"); }
             }
         }
+        "vanguards" => {
+            match args.get(2).map(|s| s.as_str()) {
+                Some("list")   => cmd_vanguards_list(&args[3..]).await?,
+                Some("forget") => cmd_vanguards_forget(&args[3..]).await?,
+                Some("clear")  => cmd_vanguards_clear(&args[3..]).await?,
+                _ => { eprintln!("Usage: phi vanguards list|forget <node_id_hex>|clear"); }
+            }
+        }
+        "auth" => {
+            match args.get(2).map(|s| s.as_str()) {
+                Some("gen-client")    => cmd_auth_gen_client(&args[3..]).await?,
+                Some("add-client")    => cmd_auth_add_client(&args[3..]).await?,
+                Some("list-clients")  => cmd_auth_list_clients(&args[3..]).await?,
+                Some("remove-client") => cmd_auth_remove_client(&args[3..]).await?,
+                _ => { eprintln!("Usage: phi auth gen-client|add-client|list-clients|remove-client"); }
+            }
+        }
         "help"|"--help"|"-h" => usage(),
         other      => { eprintln!("Unknown command: {}\n", other); usage(); }
     }
@@ -409,7 +634,7 @@ async fn main() -> Result<()> {
 }
 
 fn usage() {
-    println!("\n  phi -- PHINET hidden service CLI\n\n  Sites:\n    phi new <n>                Create a hidden service\n    phi init <n> [dir]         Generate starter site files\n    phi deploy <hs_id> <dir>   Deploy a directory\n    phi put <hs_id> <url> <f>  Upload a single file\n    phi list                   List all services\n    phi info <hs_id>           Show service files\n    phi delete <hs_id>         Delete a service\n    phi register <hs_id>       Publish to live network\n\n  Board (anonymous messaging):\n    phi board post <ch> <msg>  Post to a channel\n    phi board read [ch]        Read a channel  [default: general]\n    phi board channels         Show channels with posts\n\n  Circuits (onion routing):\n    phi circuit status         Show origin/relay counts\n    phi circuit build <path>   Build a multi-hop circuit\n                               path = id@host:port,id@host:port,...\n\n  Network:\n    phi peers                  Show connected peers\n    phi status                 Show daemon status\n");
+    println!("\n  phi -- PHINET hidden service CLI\n\n  Sites:\n    phi new <n>                Create a hidden service\n    phi init <n> [dir]         Generate starter site files\n    phi deploy <hs_id> <dir>   Deploy a directory\n    phi put <hs_id> <url> <f>  Upload a single file\n    phi list                   List all services\n    phi info <hs_id>           Show service files\n    phi delete <hs_id>         Delete a service\n    phi register <hs_id>       Publish to live network\n\n  Board (anonymous messaging):\n    phi board post <ch> <msg>  Post to a channel\n    phi board read [ch]        Read a channel  [default: general]\n    phi board channels         Show channels with posts\n\n  Circuits (onion routing):\n    phi circuit status         Show origin/relay counts\n    phi circuit build <path>   Build a multi-hop circuit\n                               path = id@host:port,id@host:port,...\n\n  Vanguards (HS guard-discovery defense):\n    phi vanguards list                 Show layer-2 vanguard set\n    phi vanguards forget <node_id_hex> Mark one vanguard unreachable\n    phi vanguards clear                Mark all vanguards unreachable\n\n  HS client auth (private hidden services):\n    phi auth gen-client                Generate a client keypair\n    phi auth add-client <hs> <pub>     Authorize a client for a service\n    phi auth list-clients <hs>         Show authorized clients for a service\n    phi auth remove-client <hs> <pub>  Revoke a client's access\n\n  Network:\n    phi peers                  Show connected peers\n    phi status                 Show daemon status\n");
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
