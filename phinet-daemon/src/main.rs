@@ -73,6 +73,7 @@ struct Req {
     name:     Option<String>,
     channel:  Option<String>,
     text:     Option<String>,
+    node_id_hex: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -308,12 +309,46 @@ async fn dispatch(req: &Req, node: &Arc<PhiNode>) -> Resp {
         "hs_register" => {
             let name = req.name.as_deref().unwrap_or("").to_string();
             let hs   = node.register_hs(&name).await;
-            let desc = hs.descriptor(Some(&detect_ip()), Some(node.port + 1));
+
+            // Check the per-service authorized client list. If empty,
+            // publish a public descriptor (anyone can resolve). If
+            // populated, encrypt the intro point to those clients.
+            let host = detect_ip();
+            let port = node.port + 1;
+
+            let clients_hex = node.store.list_authorized_clients(&hs.hs_id).await;
+            let desc = if clients_hex.is_empty() {
+                hs.descriptor(Some(&host), Some(port))
+            } else {
+                // Parse hex pubkeys to [u8; 32]
+                let mut client_pubs: Vec<[u8; 32]> = Vec::new();
+                for h in &clients_hex {
+                    match hex::decode(h).ok().and_then(|v| v.try_into().ok()) {
+                        Some(b) => client_pubs.push(b),
+                        None => {
+                            return Resp::err(&format!(
+                                "hs_register: malformed client pubkey in store: {}", h));
+                        }
+                    }
+                }
+                match hs.descriptor_with_client_auth(
+                    Some(&host), Some(port), &client_pubs,
+                ) {
+                    Ok(d) => {
+                        info!("hs_register: publishing {} with client-auth ({} clients)",
+                            &hs.hs_id[..16], client_pubs.len());
+                        d
+                    }
+                    Err(e) => return Resp::err(&format!(
+                        "hs_register: descriptor_with_client_auth: {}", e)),
+                }
+            };
             node.broadcast_hs(desc, &hs.identity).await;
             Resp::ok(serde_json::json!({
                 "hs_id":     hs.hs_id,
                 "name":      hs.name,
                 "intro_pub": hex::encode(hs.intro_pub.as_bytes()),
+                "client_auth_clients": clients_hex.len(),
             }))
         }
 
@@ -745,6 +780,144 @@ async fn dispatch(req: &Req, node: &Arc<PhiNode>) -> Resp {
                 Ok(updated) => Resp::ok(serde_json::json!({"updated": updated})),
                 Err(e)      => Resp::err(&e),
             }
+        }
+
+        // ── Vanguard management ─────────────────────────────────
+        // List entries: { "cmd": "vanguards_list" }
+        // Returns: [{ node_id_hex, host, port, added_at, last_used,
+        //             unreachable_since }, ...]
+        "vanguards_list" => {
+            let entries = node.vanguards.list();
+            Resp::ok(serde_json::json!({
+                "entries": entries.iter().map(|e| serde_json::json!({
+                    "node_id_hex":       e.node_id_hex,
+                    "host":              e.host,
+                    "port":              e.port,
+                    "added_at":          e.added_at,
+                    "last_used":         e.last_used,
+                    "unreachable_since": e.unreachable_since,
+                })).collect::<Vec<_>>(),
+                "active_count": node.vanguards.active_count(),
+            }))
+        }
+        // Forget a single vanguard: { "cmd": "vanguards_forget",
+        //                             "node_id_hex": "abcd..." }
+        "vanguards_forget" => {
+            let id = req.node_id_hex.as_deref().unwrap_or("");
+            if id.is_empty() {
+                return Resp::err("vanguards_forget: missing node_id_hex");
+            }
+            // Mark unreachable so it ages out via maintain. We don't
+            // expose a synchronous removal because that could cause
+            // anti-churn bypass — operators who *really* want to
+            // start fresh should use vanguards_clear.
+            node.vanguards.mark_unreachable(id);
+            Resp::ok(serde_json::json!({"marked_unreachable": id}))
+        }
+        // Clear all vanguards: { "cmd": "vanguards_clear" }
+        // Forces a fresh set on next HS-circuit build. Use sparingly:
+        // disrupts the layered-guard property until enough new builds
+        // have repopulated the set.
+        "vanguards_clear" => {
+            // No public clear method on Vanguards (intentional —
+            // implementing it requires holding the file lock briefly).
+            // Mark every entry unreachable, then call maintain() to
+            // remove the long-unreachable ones. New entries will
+            // populate on next build_hs_circuit.
+            let entries = node.vanguards.list();
+            for e in &entries {
+                node.vanguards.mark_unreachable(&e.node_id_hex);
+            }
+            // We don't immediately remove — anti-churn protection
+            // keeps entries for LAYER2_MIN_LIFETIME (24h). But marking
+            // them all unreachable means they won't be picked.
+            Resp::ok(serde_json::json!({
+                "marked": entries.len(),
+                "note": "entries persist for 24h (anti-churn). pick_layer2 will return None until then or until new entries are added.",
+            }))
+        }
+
+        // ── Hidden-service client-auth helpers ─────────────────
+        // Generate a client keypair (operator gives the pubkey to a
+        // client out-of-band). Doesn't involve the daemon's identity;
+        // pure local key generation.
+        // { "cmd": "hs_auth_gen_client" }
+        "hs_auth_gen_client" => {
+            use rand::rngs::OsRng;
+            let sec = phinet_core::x25519_dalek::StaticSecret::random_from_rng(OsRng);
+            let pubk = phinet_core::x25519_dalek::PublicKey::from(&sec);
+            Resp::ok(serde_json::json!({
+                "secret_hex": hex::encode(sec.to_bytes()),
+                "public_hex": hex::encode(pubk.as_bytes()),
+                "note": "save the secret somewhere safe; share only the public key with the HS operator",
+            }))
+        }
+
+        // Authorize a client to access a hidden service.
+        // { "cmd": "hs_auth_add_client", "hs_id": "...", "text": "<pubkey-hex>" }
+        // After adding the first client, subsequent hs_register calls
+        // will publish a client-auth descriptor instead of a public one.
+        "hs_auth_add_client" => {
+            let hs_id = match req.hs_id.as_deref() {
+                Some(s) if !s.is_empty() => s,
+                _ => return Resp::err("hs_auth_add_client: missing hs_id"),
+            };
+            let pubk = match req.text.as_deref() {
+                Some(s) if !s.is_empty() => s,
+                _ => return Resp::err("hs_auth_add_client: missing client pubkey (in 'text' field)"),
+            };
+            match node.store.add_authorized_client(hs_id, pubk).await {
+                Ok(true)  => Resp::ok(serde_json::json!({
+                    "added": true, "hs_id": hs_id,
+                    "client_pub": pubk.trim().to_lowercase(),
+                })),
+                Ok(false) => Resp::ok(serde_json::json!({
+                    "added": false, "reason": "already authorized",
+                })),
+                Err(e) => Resp::err(&format!("hs_auth_add_client: {}", e)),
+            }
+        }
+
+        // Remove an authorized client.
+        // { "cmd": "hs_auth_remove_client", "hs_id": "...", "text": "<pubkey-hex>" }
+        // If the resulting list is empty, the file is removed and the
+        // service publishes as public on next hs_register.
+        "hs_auth_remove_client" => {
+            let hs_id = match req.hs_id.as_deref() {
+                Some(s) if !s.is_empty() => s,
+                _ => return Resp::err("hs_auth_remove_client: missing hs_id"),
+            };
+            let pubk = match req.text.as_deref() {
+                Some(s) if !s.is_empty() => s,
+                _ => return Resp::err("hs_auth_remove_client: missing client pubkey"),
+            };
+            match node.store.remove_authorized_client(hs_id, pubk).await {
+                Ok(true)  => Resp::ok(serde_json::json!({
+                    "removed": true,
+                    "remaining": node.store.list_authorized_clients(hs_id).await.len(),
+                })),
+                Ok(false) => Resp::ok(serde_json::json!({
+                    "removed": false, "reason": "not in list",
+                })),
+                Err(e) => Resp::err(&format!("hs_auth_remove_client: {}", e)),
+            }
+        }
+
+        // List authorized clients.
+        // { "cmd": "hs_auth_list_clients", "hs_id": "..." }
+        "hs_auth_list_clients" => {
+            let hs_id = match req.hs_id.as_deref() {
+                Some(s) if !s.is_empty() => s,
+                _ => return Resp::err("hs_auth_list_clients: missing hs_id"),
+            };
+            let clients = node.store.list_authorized_clients(hs_id).await;
+            let count = clients.len();
+            Resp::ok(serde_json::json!({
+                "hs_id":   hs_id,
+                "clients": clients,
+                "count":   count,
+                "mode":    if count == 0 { "public" } else { "client-auth" },
+            }))
         }
 
         other => Resp::err(&format!("unknown command: {}", other)),
