@@ -77,6 +77,100 @@ impl SiteStore {
     fn site_dir(&self, hs_id: &str) -> PathBuf { self.root.join(hs_id) }
     fn meta_path(&self, hs_id: &str) -> PathBuf { self.site_dir(hs_id).join("_meta.json") }
     fn www_dir(&self,  hs_id: &str) -> PathBuf { self.site_dir(hs_id).join("www") }
+    /// Per-service authorized client list. Each line in this file
+    /// is one X25519 public key (hex). When this file exists and is
+    /// non-empty, the daemon publishes the descriptor with
+    /// client-auth (only listed clients can resolve the intro point).
+    /// When absent or empty, the descriptor is published without
+    /// auth (everyone can resolve).
+    fn clients_path(&self, hs_id: &str) -> PathBuf {
+        self.site_dir(hs_id).join("authorized_clients.txt")
+    }
+
+    /// Add an authorized client public key for this service. The
+    /// pubkey must be 32 bytes hex-encoded (64 hex chars). Returns
+    /// `Ok(true)` if added, `Ok(false)` if already present.
+    pub async fn add_authorized_client(
+        &self,
+        hs_id: &str,
+        client_pub_hex: &str,
+    ) -> Result<bool> {
+        if !self.site_dir(hs_id).exists() {
+            return Err(Error::NotFound(format!("service {}", hs_id)));
+        }
+        let normalized = client_pub_hex.trim().to_lowercase();
+        if normalized.len() != 64 ||
+           !normalized.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return Err(Error::Crypto(
+                "client pubkey must be 64 hex chars (32 bytes)".into()));
+        }
+        let mut current = self.list_authorized_clients(hs_id).await;
+        if current.iter().any(|p| p == &normalized) {
+            return Ok(false);
+        }
+        current.push(normalized);
+        let body = format!(
+            "# ΦNET authorized clients for service {}\n\
+             # one X25519 pubkey (hex) per line; lines starting with # are comments\n\
+             {}\n",
+            hs_id,
+            current.join("\n"),
+        );
+        fs::write(self.clients_path(hs_id), body).await?;
+        Ok(true)
+    }
+
+    /// Remove an authorized client. Returns `Ok(true)` if found and
+    /// removed, `Ok(false)` if not in the list.
+    pub async fn remove_authorized_client(
+        &self,
+        hs_id: &str,
+        client_pub_hex: &str,
+    ) -> Result<bool> {
+        if !self.site_dir(hs_id).exists() {
+            return Err(Error::NotFound(format!("service {}", hs_id)));
+        }
+        let normalized = client_pub_hex.trim().to_lowercase();
+        let current = self.list_authorized_clients(hs_id).await;
+        if !current.iter().any(|p| p == &normalized) {
+            return Ok(false);
+        }
+        let remaining: Vec<String> = current.into_iter()
+            .filter(|p| p != &normalized).collect();
+        if remaining.is_empty() {
+            // Empty list = remove the file entirely so the descriptor
+            // publishes without client-auth (rather than with an
+            // empty list, which would lock everyone out).
+            let _ = fs::remove_file(self.clients_path(hs_id)).await;
+        } else {
+            let body = format!(
+                "# ΦNET authorized clients for service {}\n\
+                 # one X25519 pubkey (hex) per line; lines starting with # are comments\n\
+                 {}\n",
+                hs_id,
+                remaining.join("\n"),
+            );
+            fs::write(self.clients_path(hs_id), body).await?;
+        }
+        Ok(true)
+    }
+
+    /// List authorized client pubkeys for a service. Returns empty
+    /// vec when the file is absent or contains no non-comment lines.
+    pub async fn list_authorized_clients(&self, hs_id: &str) -> Vec<String> {
+        let path = self.clients_path(hs_id);
+        let content = match fs::read_to_string(&path).await {
+            Ok(s)  => s,
+            Err(_) => return Vec::new(),
+        };
+        content.lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| l.to_lowercase())
+            .filter(|l| l.len() == 64 && l.chars().all(|c| c.is_ascii_hexdigit()))
+            .collect()
+    }
 
     // ── Writes ────────────────────────────────────────────────────────
 
@@ -497,6 +591,105 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(body, b"world");
         assert!(ct.contains("plain"));
+    }
+
+    // ── Authorized client list ────────────────────────────────────────
+
+    fn fake_pub_hex(seed: u8) -> String {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        bytes[31] = seed.wrapping_add(99);
+        hex::encode(bytes)
+    }
+
+    #[tokio::test]
+    async fn authorized_clients_empty_by_default() {
+        let s = SiteStore::new_test();
+        s.create_service("svc1aaaaaaaaaaaaaaaa", "s", "00").await.unwrap();
+        let clients = s.list_authorized_clients("svc1aaaaaaaaaaaaaaaa").await;
+        assert!(clients.is_empty(),
+            "newly-created service must have no authorized clients (= public)");
+    }
+
+    #[tokio::test]
+    async fn add_authorized_client_succeeds() {
+        let s = SiteStore::new_test();
+        s.create_service("svc2aaaaaaaaaaaaaaaa", "s", "00").await.unwrap();
+        let pubk = fake_pub_hex(1);
+        assert!(s.add_authorized_client("svc2aaaaaaaaaaaaaaaa", &pubk).await.unwrap());
+        let clients = s.list_authorized_clients("svc2aaaaaaaaaaaaaaaa").await;
+        assert_eq!(clients, vec![pubk]);
+    }
+
+    #[tokio::test]
+    async fn add_duplicate_returns_false() {
+        let s = SiteStore::new_test();
+        s.create_service("svc3aaaaaaaaaaaaaaaa", "s", "00").await.unwrap();
+        let pubk = fake_pub_hex(2);
+        assert!(s.add_authorized_client("svc3aaaaaaaaaaaaaaaa", &pubk).await.unwrap());
+        assert!(!s.add_authorized_client("svc3aaaaaaaaaaaaaaaa", &pubk).await.unwrap());
+        let clients = s.list_authorized_clients("svc3aaaaaaaaaaaaaaaa").await;
+        assert_eq!(clients.len(), 1, "duplicate must not be re-added");
+    }
+
+    #[tokio::test]
+    async fn malformed_pubkey_rejected() {
+        let s = SiteStore::new_test();
+        s.create_service("svc4aaaaaaaaaaaaaaaa", "s", "00").await.unwrap();
+        // Wrong length
+        assert!(s.add_authorized_client("svc4aaaaaaaaaaaaaaaa", "deadbeef")
+            .await.is_err());
+        // Non-hex
+        let bad = "g".repeat(64);
+        assert!(s.add_authorized_client("svc4aaaaaaaaaaaaaaaa", &bad)
+            .await.is_err());
+    }
+
+    #[tokio::test]
+    async fn remove_authorized_client_works() {
+        let s = SiteStore::new_test();
+        s.create_service("svc5aaaaaaaaaaaaaaaa", "s", "00").await.unwrap();
+        let p1 = fake_pub_hex(1);
+        let p2 = fake_pub_hex(2);
+        s.add_authorized_client("svc5aaaaaaaaaaaaaaaa", &p1).await.unwrap();
+        s.add_authorized_client("svc5aaaaaaaaaaaaaaaa", &p2).await.unwrap();
+        assert!(s.remove_authorized_client("svc5aaaaaaaaaaaaaaaa", &p1).await.unwrap());
+        let remaining = s.list_authorized_clients("svc5aaaaaaaaaaaaaaaa").await;
+        assert_eq!(remaining, vec![p2]);
+    }
+
+    #[tokio::test]
+    async fn remove_nonexistent_returns_false() {
+        let s = SiteStore::new_test();
+        s.create_service("svc6aaaaaaaaaaaaaaaa", "s", "00").await.unwrap();
+        let p = fake_pub_hex(1);
+        assert!(!s.remove_authorized_client("svc6aaaaaaaaaaaaaaaa", &p).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn removing_last_client_clears_file() {
+        // After removing the last entry, the file should be gone so
+        // the descriptor reverts to "public" (no client-auth) rather
+        // than "auth with empty list" (which would lock everyone out).
+        let s = SiteStore::new_test();
+        s.create_service("svc7aaaaaaaaaaaaaaaa", "s", "00").await.unwrap();
+        let p = fake_pub_hex(1);
+        s.add_authorized_client("svc7aaaaaaaaaaaaaaaa", &p).await.unwrap();
+        s.remove_authorized_client("svc7aaaaaaaaaaaaaaaa", &p).await.unwrap();
+        assert!(s.list_authorized_clients("svc7aaaaaaaaaaaaaaaa").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn comments_and_blanks_are_skipped() {
+        // Manually write a file with comments and blanks; verify
+        // list_authorized_clients filters them out.
+        let s = SiteStore::new_test();
+        s.create_service("svc8aaaaaaaaaaaaaaaa", "s", "00").await.unwrap();
+        let p = fake_pub_hex(1);
+        let body = format!("# alice's key\n\n{}\n# trailing\n", p);
+        fs::write(s.clients_path("svc8aaaaaaaaaaaaaaaa"), body).await.unwrap();
+        let listed = s.list_authorized_clients("svc8aaaaaaaaaaaaaaaa").await;
+        assert_eq!(listed, vec![p]);
     }
 
     #[tokio::test]

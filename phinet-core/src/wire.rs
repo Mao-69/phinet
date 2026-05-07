@@ -226,12 +226,20 @@ pub struct DhtValue {
 /// `identity_pub` field here is the long-term key; the `sig` is made
 /// under the blinded subkey for `epoch`. See `hs_identity.rs` for the
 /// derivation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HsDescriptor {
     pub hs_id:      String,
     pub name:       String,
+    /// Plaintext intro point pubkey. **Empty when `client_auth` is
+    /// `Some(_)`** — in that case the real intro_pub lives inside
+    /// the encrypted `ClientAuthBlock` and only authorized clients
+    /// can recover it. Public-access services leave `client_auth`
+    /// `None` and populate this field directly.
     pub intro_pub:  String,
+    /// Plaintext intro host. Same convention as `intro_pub`: empty
+    /// when client-auth is in use.
     pub intro_host: Option<String>,
+    /// Plaintext intro port. Same convention.
     pub intro_port: Option<u16>,
     /// HS long-term Ed25519 public key, hex-encoded. The `hs_id`
     /// must equal the derived ID of this key.
@@ -252,6 +260,18 @@ pub struct HsDescriptor {
     /// blinding scheme — see hs_identity.rs. Hex-encoded 32 bytes.
     #[serde(default)]
     pub blinded_pub: String,
+    /// Optional client-auth block. When `Some(_)`, the descriptor's
+    /// intro point is encrypted and only clients with one of the
+    /// authorized X25519 secrets can recover it. `intro_pub`,
+    /// `intro_host`, `intro_port` are left empty in this case.
+    ///
+    /// Client-auth is end-to-end between the HS operator and the
+    /// authorized clients — relays storing the descriptor in the
+    /// DHT learn nothing about who's authorized or what the real
+    /// intro point is. The block IS covered by the descriptor
+    /// signature though, so an HSDir can't tamper with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_auth: Option<crate::client_auth::ClientAuthBlock>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

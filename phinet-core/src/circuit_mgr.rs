@@ -109,6 +109,13 @@ pub struct OriginCircuit {
     /// accumulates dead circuits forever — each one holds memory for
     /// key state, stream muxes, hop keys, etc.
     pub last_activity: std::time::Instant,
+    /// Per-circuit padding scheduler. The padding pump task polls
+    /// `should_pad_now()` and emits RELAY_DROP cells via the guard
+    /// hop on its decisions. Set via
+    /// `CircuitManager::set_padding_scheduler` after construction or
+    /// left as `NoPadding` (the default — circuits don't pad unless
+    /// the operator opted in).
+    pub padding_scheduler: std::sync::Arc<dyn crate::padding::PaddingScheduler>,
 }
 
 impl OriginCircuit {
@@ -123,6 +130,7 @@ impl OriginCircuit {
             circ_send_window: crate::stream::CIRCUIT_WINDOW_START,
             circ_delivered_since_sendme: 0,
             last_activity: std::time::Instant::now(),
+            padding_scheduler: std::sync::Arc::new(crate::padding::NoPadding),
         }
     }
 
@@ -360,6 +368,34 @@ impl CircuitManager {
 
     fn fresh_origin_id(&self) -> CircuitId {
         CircuitId(self.next_origin_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Install a padding scheduler on an existing origin circuit.
+    /// Returns true if the circuit was found, false otherwise.
+    ///
+    /// Typical use: after `build_circuit` returns the cid, daemon
+    /// code optionally calls this to enable padding. The scheduler
+    /// is shared via Arc so the same instance can be used across
+    /// many circuits if desired (e.g. one ConstantRate scheduler
+    /// per HS-related circuit family).
+    ///
+    /// **Note**: the `padding_pump_loop` task that polls schedulers
+    /// already spawned in `build_circuit`. If the previous scheduler
+    /// was `NoPadding`, that task already exited; this method
+    /// doesn't restart it. To enable padding, call this *before*
+    /// invoking `build_circuit`, or via the `build_circuit_with_padding`
+    /// convenience on PhiNode.
+    pub fn set_padding_scheduler(
+        &mut self,
+        cid: CircuitId,
+        scheduler: std::sync::Arc<dyn crate::padding::PaddingScheduler>,
+    ) -> bool {
+        if let Some(oc) = self.origins.get_mut(&cid) {
+            oc.padding_scheduler = scheduler;
+            true
+        } else {
+            false
+        }
     }
 
     /// Drop circuits that haven't seen activity in

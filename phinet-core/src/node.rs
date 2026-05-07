@@ -75,6 +75,17 @@ struct HsRendezvousIntent {
     e2e_keys:   crate::rendezvous::E2EKeys,
 }
 
+/// Result of resolving an HsDescriptor to a usable intro point.
+/// For public services this trivially mirrors the descriptor's
+/// public fields; for client-authorized services the contents
+/// were decrypted from the descriptor's `ClientAuthBlock`.
+#[derive(Debug, Clone)]
+pub struct ResolvedIntro {
+    pub intro_pub:  [u8; 32],
+    pub intro_host: Option<String>,
+    pub intro_port: Option<u16>,
+}
+
 pub struct PhiNode {
     pub host:    String,
     pub port:    u16,
@@ -94,6 +105,20 @@ pub struct PhiNode {
     /// Persistent guard tracking. Survives daemon restarts to prevent
     /// the first-hop rotation attack.
     pub guard_mgr: Arc<crate::guards::GuardManager>,
+
+    /// Layer-2 vanguard set for HS-related circuits. Used as the
+    /// second hop of any circuit built via `build_hs_circuit`. See
+    /// `vanguards.rs` for the threat model. Persistent across daemon
+    /// restarts.
+    pub vanguards: Arc<crate::vanguards::Vanguards>,
+
+    /// Operator-configured padding scheduler for HS-side circuits.
+    /// `None` means use `NoPadding` (no traffic generated). Set via
+    /// `set_hs_padding_scheduler` from daemon startup or runtime.
+    /// Applies to circuits built via the HS rendezvous drain
+    /// (`drain_hs_pending_rendezvous`); doesn't affect general
+    /// `build_circuit` calls.
+    pub hs_padding_scheduler: ARwLock<Option<Arc<dyn crate::padding::PaddingScheduler>>>,
 
     /// Per-node state machine for multi-hop circuits (CREATE/EXTEND2/RELAY).
     /// Shared across all peer connections so a RelayCircuit on one
@@ -233,6 +258,19 @@ impl PhiNode {
                     ).unwrap()
                 }))
             },
+            vanguards: {
+                let dir = dirs::home_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join(".phinet");
+                let path = dir.join("vanguards.json");
+                Arc::new(crate::vanguards::Vanguards::open(path).unwrap_or_else(|e| {
+                    warn!("vanguards: persistence disabled: {}", e);
+                    crate::vanguards::Vanguards::open(
+                        std::path::PathBuf::from("/tmp/phinet_vanguards.json")
+                    ).unwrap()
+                }))
+            },
+            hs_padding_scheduler: ARwLock::new(None),
             circuits:      ARwLock::new(crate::circuit_mgr::CircuitManager::new()),
             hs_pending_rendezvous: ARwLock::new(std::collections::VecDeque::new()),
             rotation_seq:          AtomicU64::new(0),
@@ -928,6 +966,19 @@ impl PhiNode {
                                 }
 
                                 _ => {
+                                    if rc.command == RelayCommand::Drop {
+                                        // Padding cell from a relay. Just
+                                        // discard it. Notify the scheduler
+                                        // that something arrived (it
+                                        // counts as cell activity from
+                                        // its perspective, even though
+                                        // we generated it as padding).
+                                        if let Some(oc) = mgr.origins.get(&cell.circ_id) {
+                                            oc.padding_scheduler.on_padding_cell(
+                                                std::time::Instant::now());
+                                        }
+                                        return;
+                                    }
                                     debug!("origin cell cmd={:?} stream={}",
                                            rc.command, rc.stream_id);
                                 }
@@ -1107,6 +1158,12 @@ impl PhiNode {
                                 }
 
                                 other => {
+                                    if other == RelayCommand::Drop {
+                                        // Padding cell terminating at us.
+                                        // Discard silently — that's the
+                                        // whole point.
+                                        return;
+                                    }
                                     debug!("relay handle: unexpected cmd {:?}", other);
                                 }
                             }
@@ -1821,8 +1878,29 @@ impl PhiNode {
                 static_pub: rp_static_pub,
             };
             let node = Arc::clone(&self);
-            let rp_cid = match node.build_circuit(vec![rp_link]).await {
-                Ok(c) => c,
+            // HS-side rendezvous circuit. We use `build_hs_circuit`
+            // even though it's currently a 1-hop circuit (HS → RP) —
+            // for 1-hop paths the function falls through to regular
+            // `build_circuit`, but if the design ever evolves to
+            // include intermediate hops between HS and RP (e.g. for
+            // additional anonymity), vanguards will kick in
+            // automatically. Padding scheduler is also installed on
+            // every HS-side circuit at the operator-configured rate
+            // (or NoPadding if not configured).
+            let scheduler: Arc<dyn crate::padding::PaddingScheduler> =
+                self.hs_padding_scheduler.read().await.clone()
+                    .unwrap_or_else(|| Arc::new(crate::padding::NoPadding));
+            let rp_cid = match Arc::clone(&node)
+                .build_hs_circuit(vec![rp_link]).await
+            {
+                Ok(c) => {
+                    // Install the padding scheduler now that the
+                    // circuit's built. Scheduler swap-in is safe
+                    // because the pump rechecks every 5s by default.
+                    let mut mgr = self.circuits.write().await;
+                    let _ = mgr.set_padding_scheduler(c, scheduler);
+                    c
+                }
                 Err(e) => {
                     debug!("hs drain: build RP circuit: {}", e);
                     continue;
@@ -2270,7 +2348,337 @@ impl PhiNode {
             }
         }
 
+        // ── Padding pump ─────────────────────────────────────────
+        //
+        // Each circuit gets a per-circuit padding scheduler. By
+        // default this is `NoPadding` (no traffic generated); set
+        // a different scheduler via `CircuitManager::set_padding_scheduler`
+        // before/during construction to enable padding.
+        //
+        // This task polls the scheduler at most every 50ms and
+        // emits RELAY_DROP cells through the guard hop on the
+        // scheduler's say-so. The DROP cells are recognized and
+        // discarded by the receiving relay (see
+        // `RelayCommand::Drop` handling in node.rs::dispatch).
+        //
+        // The task exits when the circuit is destroyed (origin
+        // record removed from the manager).
+        let pad_node = Arc::clone(&self);
+        let pad_cid = cid;
+        tokio::spawn(async move {
+            pad_node.padding_pump_loop(pad_cid).await;
+        });
+
         Ok(cid)
+    }
+
+    /// Per-circuit padding pump. Runs until the circuit is destroyed
+    /// or the scheduler indicates `Never`. Polls at most every 50ms;
+    /// when the scheduler says `Now`, emits a RELAY_DROP cell. When
+    /// it says `SleepFor(d)`, sleeps for `d` (capped at 5s so the
+    /// task is responsive to circuit teardown).
+    async fn padding_pump_loop(self: Arc<Self>, cid: crate::circuit::CircuitId) {
+        use crate::circuit::{RelayCell, RelayCommand};
+        use crate::padding::PadDecision;
+        use std::time::Instant;
+
+        const MAX_SLEEP: Duration = Duration::from_secs(5);
+        const MIN_SLEEP: Duration = Duration::from_millis(50);
+
+        loop {
+            // Snapshot what we need from the circuit and drop the lock
+            // before sleeping or emitting (lock contention would
+            // otherwise stall the dispatch path).
+            let (scheduler, guard_peer, scheduler_name) = {
+                let mgr = self.circuits.read().await;
+                let Some(oc) = mgr.origins.get(&cid) else {
+                    // Circuit gone → exit task.
+                    return;
+                };
+                (Arc::clone(&oc.padding_scheduler), oc.peer, oc.padding_scheduler.name().to_string())
+            };
+
+            // For NoPadding we still want a low-frequency wake-up
+            // so the pump can pick up a scheduler that's swapped in
+            // later via set_padding_scheduler. Sleep ~5s and re-check.
+            if scheduler_name == "none" {
+                tokio::time::sleep(MAX_SLEEP).await;
+                continue;
+            }
+
+            let now = Instant::now();
+            match scheduler.should_pad_now(now) {
+                PadDecision::Never => return,
+                PadDecision::SleepFor(d) => {
+                    let dur = d.clamp(MIN_SLEEP, MAX_SLEEP);
+                    tokio::time::sleep(dur).await;
+                    continue;
+                }
+                PadDecision::Now => {
+                    // Build a DROP cell. Payload bytes are random so
+                    // the cell isn't distinguishable from real DATA
+                    // traffic by ciphertext alone.
+                    let mut payload = vec![0u8; 32];
+                    rand::rngs::OsRng.fill_bytes(&mut payload);
+                    // Validate it round-trips cleanly before sending.
+                    if RelayCell::new(
+                        RelayCommand::Drop, 0, payload.clone(),
+                    ).is_err() {
+                        return;
+                    }
+
+                    // Onion-encrypt and send via the guard. We use
+                    // send_stream_relay which handles the layered
+                    // encryption; if it fails (circuit destroyed),
+                    // exit the task.
+                    if let Err(_) = self.send_stream_relay(
+                        cid, 0, RelayCommand::Drop, payload,
+                    ).await {
+                        return;
+                    }
+
+                    scheduler.on_padding_cell(now);
+                    // After emitting, give the scheduler a chance to
+                    // re-evaluate; loop back to should_pad_now.
+                    tokio::time::sleep(MIN_SLEEP).await;
+                }
+            }
+        }
+    }
+
+    /// Build a circuit with a specific padding scheduler attached.
+    ///
+    /// Equivalent to calling `build_circuit` and then immediately
+    /// `set_padding_scheduler`, except: this version installs the
+    /// scheduler *before* spawning the padding pump, so the pump
+    /// immediately uses the requested scheduler instead of cycling
+    /// through one wakeup with `NoPadding` before being replaced.
+    ///
+    /// Pass an `Arc<NoPadding>` (the default) to disable padding
+    /// for this circuit even if the operator sets a network-wide
+    /// default later — useful for circuits where padding overhead
+    /// matters more than fingerprinting resistance (e.g. internal
+    /// bandwidth scans).
+    pub async fn build_circuit_with_padding(
+        self: Arc<Self>,
+        path: Vec<crate::circuit::LinkSpec>,
+        scheduler: Arc<dyn crate::padding::PaddingScheduler>,
+    ) -> Result<crate::circuit::CircuitId> {
+        let cid = Arc::clone(&self).build_circuit(path).await?;
+        // Install scheduler before the next padding pump iteration
+        // wakes up. There's a small race window where the pump may
+        // sample the default `NoPadding` once; we accept that — the
+        // worst case is one missed pad cycle (~50ms), which is
+        // operationally insignificant.
+        let mut mgr = self.circuits.write().await;
+        mgr.set_padding_scheduler(cid, scheduler);
+        Ok(cid)
+    }
+
+    /// Build an HS-related circuit using layer-2 vanguards for hop 2.
+    ///
+    /// HS-related circuits include:
+    /// - introduction circuits (HS → IP)
+    /// - rendezvous circuits (HS → RP, client → RP)
+    ///
+    /// For these circuits, the second hop is selected from a small
+    /// rotating set of "vanguards" — long-lived (~10 day) helper
+    /// relays. This defends against guard-discovery attacks where
+    /// an adversary forces the HS to build many circuits and waits
+    /// to be selected as the random second hop, then probes from
+    /// there to find the actual guard.
+    ///
+    /// `candidate_paths` is a list of paths the daemon would
+    /// otherwise have built. The first hop is taken from
+    /// `candidate_paths[0]` (caller's guard choice). The second hop
+    /// is replaced with a layer-2 vanguard when available; if no
+    /// vanguards are populated yet, the original second hop is
+    /// used and added to the vanguard set for next time.
+    /// Subsequent hops (if any) come from the original path.
+    ///
+    /// Returns the cid of the built circuit.
+    pub async fn build_hs_circuit(
+        self: Arc<Self>,
+        candidate_path: Vec<crate::circuit::LinkSpec>,
+    ) -> Result<crate::circuit::CircuitId> {
+        if candidate_path.len() < 2 {
+            // Vanguards only matter for ≥2-hop circuits. Fall through
+            // to regular build for trivial cases.
+            return Arc::clone(&self).build_circuit(candidate_path).await;
+        }
+
+        let mut path = candidate_path.clone();
+
+        // Try to substitute hop 2 with a layer-2 vanguard. If we
+        // have one, use it. If not, populate the vanguard set with
+        // hop 2 (the originally-selected relay) so next time we have
+        // a vanguard to pick from.
+        if let Some(vg) = self.vanguards.pick_layer2() {
+            // Convert vanguard entry into LinkSpec
+            let vg_node_id: [u8; 32] = match hex::decode(&vg.node_id_hex)
+                .ok().and_then(|v| v.try_into().ok())
+            {
+                Some(b) => b,
+                None => {
+                    tracing::warn!("vanguard has malformed node_id, falling back to candidate");
+                    // Fall through to populating with the candidate
+                    self.populate_vanguard(&path[1]);
+                    return Arc::clone(&self).build_circuit(path).await;
+                }
+            };
+            let vg_static_pub: [u8; 32] = match hex::decode(&vg.static_pub_hex)
+                .ok().and_then(|v| v.try_into().ok())
+            {
+                Some(b) => b,
+                None => {
+                    self.populate_vanguard(&path[1]);
+                    return Arc::clone(&self).build_circuit(path).await;
+                }
+            };
+
+            // Verify the vanguard is reachable as a peer. If not,
+            // mark it unreachable and fall back.
+            let connected = self.peers.read().await.contains_key(&vg_node_id);
+            if !connected {
+                tracing::debug!("vanguard {} not connected, marking unreachable",
+                    &vg.node_id_hex[..8]);
+                self.vanguards.mark_unreachable(&vg.node_id_hex);
+                self.populate_vanguard(&path[1]);
+                return Arc::clone(&self).build_circuit(path).await;
+            }
+
+            tracing::debug!("HS circuit using vanguard {} for hop 2",
+                &vg.node_id_hex[..8]);
+            path[1] = crate::circuit::LinkSpec {
+                host:       vg.host.clone(),
+                port:       vg.port,
+                node_id:    vg_node_id,
+                static_pub: vg_static_pub,
+            };
+
+            // Build, then mark vanguard as used on success
+            let result = Arc::clone(&self).build_circuit(path).await;
+            if result.is_ok() {
+                self.vanguards.mark_used(&vg.node_id_hex);
+            } else {
+                self.vanguards.mark_unreachable(&vg.node_id_hex);
+            }
+            return result;
+        }
+
+        // No vanguards populated yet — use candidate path as-is and
+        // populate the vanguard set with hop 2 for next time.
+        self.populate_vanguard(&path[1]);
+        Arc::clone(&self).build_circuit(path).await
+    }
+
+    fn populate_vanguard(&self, hop: &crate::circuit::LinkSpec) {
+        let added = self.vanguards.add_candidate(
+            &hex::encode(hop.node_id),
+            &hop.host,
+            hop.port,
+            &hex::encode(hop.static_pub),
+        );
+        if added {
+            tracing::debug!("vanguard set: added {} ({}:{})",
+                &hex::encode(&hop.node_id[..6]), hop.host, hop.port);
+        }
+    }
+
+    /// Set the padding scheduler used for HS-side circuits.
+    ///
+    /// Applies to circuits built by the HS rendezvous drain. Pass
+    /// `None` to disable padding (default behavior). Pass an
+    /// `Arc<ConstantRate>` or `Arc<AdaptiveBurst>` to enable
+    /// per-circuit padding for every HS rendezvous circuit this
+    /// node builds going forward.
+    ///
+    /// Existing circuits aren't retroactively updated — their
+    /// schedulers were captured at build time. Only new circuits
+    /// pick up this change.
+    pub async fn set_hs_padding_scheduler(
+        &self,
+        scheduler: Option<Arc<dyn crate::padding::PaddingScheduler>>,
+    ) {
+        *self.hs_padding_scheduler.write().await = scheduler;
+    }
+
+    /// Resolve an HS descriptor to a usable intro point.
+    ///
+    /// Two cases:
+    ///
+    /// **Public service** (`descriptor.client_auth.is_none()`):
+    /// returns `descriptor.intro_pub` parsed as `[u8; 32]`. This is
+    /// what every client could already do; the helper just centralizes
+    /// the parsing.
+    ///
+    /// **Client-authorized service** (`descriptor.client_auth.is_some()`):
+    /// the plaintext intro fields are blank. The function tries each
+    /// of `client_secrets` in turn against the descriptor's
+    /// `ClientAuthBlock`. The first secret that successfully decrypts
+    /// a wrapped key (and thus the intro details) wins; we return the
+    /// recovered (intro_pub, intro_host, intro_port).
+    ///
+    /// Returns `Ok(None)` if the descriptor is client-authorized and
+    /// none of the supplied secrets are authorized — i.e. this client
+    /// can't reach this hidden service. Caller should treat this as
+    /// "not authorized," not as a transient error.
+    ///
+    /// Returns `Err(...)` if the descriptor signature doesn't verify,
+    /// the public intro_pub is malformed, or the AEAD decrypt of an
+    /// authorized entry fails (which shouldn't happen — that would
+    /// indicate corruption).
+    pub fn resolve_hs_descriptor(
+        descriptor: &crate::wire::HsDescriptor,
+        client_secrets: &[x25519_dalek::StaticSecret],
+    ) -> Result<Option<ResolvedIntro>> {
+        // Step 1: signature must verify regardless of auth model
+        crate::hs_identity::verify_descriptor(descriptor)?;
+
+        // Step 2: dispatch on auth model
+        match &descriptor.client_auth {
+            None => {
+                // Public service — parse the plaintext intro_pub
+                let intro_pub_bytes: [u8; 32] = hex::decode(&descriptor.intro_pub)
+                    .map_err(|e| Error::Crypto(format!("intro_pub hex: {e}")))?
+                    .try_into()
+                    .map_err(|_| Error::Crypto("intro_pub size".into()))?;
+                Ok(Some(ResolvedIntro {
+                    intro_pub:  intro_pub_bytes,
+                    intro_host: descriptor.intro_host.clone(),
+                    intro_port: descriptor.intro_port,
+                }))
+            }
+            Some(block) => {
+                // Client-authorized — try each provided secret. We
+                // don't short-circuit on first error; a malformed
+                // entry should be skipped silently (already done by
+                // decrypt_intro_with_client_secret).
+                for sec in client_secrets {
+                    match crate::client_auth::decrypt_intro_with_client_secret(
+                        block, sec,
+                    )? {
+                        Some(intro_secret) => {
+                            // Successfully recovered the intro point
+                            let intro_pub_bytes: [u8; 32] = hex::decode(&intro_secret.intro_pub)
+                                .map_err(|e| Error::Crypto(
+                                    format!("recovered intro_pub hex: {e}")))?
+                                .try_into()
+                                .map_err(|_| Error::Crypto(
+                                    "recovered intro_pub size".into()))?;
+                            return Ok(Some(ResolvedIntro {
+                                intro_pub:  intro_pub_bytes,
+                                intro_host: intro_secret.intro_host,
+                                intro_port: intro_secret.intro_port,
+                            }));
+                        }
+                        None => continue, // try next secret
+                    }
+                }
+                // No supplied secret was authorized
+                Ok(None)
+            }
+        }
     }
 
     /// Report on existing circuits. Returns `(origin_count,
@@ -2522,12 +2930,44 @@ impl PhiNode {
                 debug!("hs republish: skip {} (never published)", hs_id);
                 continue;
             };
-            let descriptor = hs.descriptor(
-                if host.is_empty() { None } else { Some(&host) },
-                if port == 0       { None } else { Some(port)   },
-            );
-            debug!("hs republish: re-signing descriptor for {} (epoch {})",
-                   hs_id, crate::hs_identity::current_epoch());
+            let host_opt = if host.is_empty() { None } else { Some(host.as_str()) };
+            let port_opt = if port == 0       { None } else { Some(port)   };
+
+            // Honor the per-service authorized client list. If
+            // populated, build a client-auth descriptor; if empty,
+            // build a public one. Mirrors the daemon's hs_register
+            // logic so ongoing republishes don't accidentally
+            // downgrade an authed service to public.
+            let clients_hex = self.store.list_authorized_clients(&hs_id).await;
+            let descriptor = if clients_hex.is_empty() {
+                hs.descriptor(host_opt, port_opt)
+            } else {
+                let mut client_pubs: Vec<[u8; 32]> = Vec::new();
+                let mut bad = false;
+                for h in &clients_hex {
+                    match hex::decode(h).ok().and_then(|v| v.try_into().ok()) {
+                        Some(b) => client_pubs.push(b),
+                        None => {
+                            warn!("hs republish: malformed client pubkey {} for {}, \
+                                   skipping republish for safety", h, hs_id);
+                            bad = true;
+                            break;
+                        }
+                    }
+                }
+                if bad { continue; }
+                match hs.descriptor_with_client_auth(host_opt, port_opt, &client_pubs) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!("hs republish: descriptor_with_client_auth({}): {}",
+                              hs_id, e);
+                        continue;
+                    }
+                }
+            };
+
+            debug!("hs republish: re-signing descriptor for {} (epoch {}, clients={})",
+                   hs_id, crate::hs_identity::current_epoch(), clients_hex.len());
             self.broadcast_hs(descriptor, &hs.identity).await;
         }
     }
@@ -2994,5 +3434,130 @@ mod rotation_tests {
         assert_ne!(s1, s_diff_key);
         let s_diff_seq = compute_rotation_sig(&key, &old_id, &new_id, json, 43, 1000);
         assert_ne!(s1, s_diff_seq);
+    }
+
+    // ── ResolvedIntro / resolve_hs_descriptor ──────────────────────
+
+    use crate::hidden_service::HiddenService;
+    use crate::hs_identity::{current_epoch, sign_descriptor};
+    use x25519_dalek::{StaticSecret, PublicKey as XPub};
+
+    #[test]
+    fn resolve_public_descriptor_returns_plaintext_intro() {
+        let cert = PhiCert::generate(CertBits::B256).unwrap();
+        let hs = HiddenService::new(&cert, "svc-pub");
+        let unsigned = hs.descriptor(Some("intro.host"), Some(7700));
+        let signed = sign_descriptor(&hs.identity, unsigned, current_epoch());
+
+        // No client secrets needed for a public descriptor
+        let resolved = PhiNode::resolve_hs_descriptor(&signed, &[])
+            .expect("resolve should succeed")
+            .expect("public descriptor should resolve");
+        assert_eq!(resolved.intro_host.as_deref(), Some("intro.host"));
+        assert_eq!(resolved.intro_port, Some(7700));
+        // intro_pub should match the HS's intro key
+        let expected: [u8; 32] = *hs.intro_pub.as_bytes();
+        assert_eq!(resolved.intro_pub, expected);
+    }
+
+    #[test]
+    fn resolve_authed_descriptor_with_correct_secret() {
+        let cert = PhiCert::generate(CertBits::B256).unwrap();
+        let hs = HiddenService::new(&cert, "svc-priv");
+
+        let alice_sec = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let alice_pub = *XPub::from(&alice_sec).as_bytes();
+
+        let unsigned = hs.descriptor_with_client_auth(
+            Some("intro.host"), Some(8800),
+            &[alice_pub],
+        ).expect("build authed");
+        let signed = sign_descriptor(&hs.identity, unsigned, current_epoch());
+
+        let resolved = PhiNode::resolve_hs_descriptor(&signed, &[alice_sec])
+            .expect("resolve")
+            .expect("alice should be authorized");
+        assert_eq!(resolved.intro_host.as_deref(), Some("intro.host"));
+        assert_eq!(resolved.intro_port, Some(8800));
+        let expected: [u8; 32] = *hs.intro_pub.as_bytes();
+        assert_eq!(resolved.intro_pub, expected);
+    }
+
+    #[test]
+    fn resolve_authed_descriptor_unauthorized_client() {
+        let cert = PhiCert::generate(CertBits::B256).unwrap();
+        let hs = HiddenService::new(&cert, "svc-priv");
+
+        let alice_sec = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let alice_pub = *XPub::from(&alice_sec).as_bytes();
+        let eve_sec = StaticSecret::random_from_rng(rand::rngs::OsRng);
+
+        let unsigned = hs.descriptor_with_client_auth(
+            Some("intro.host"), Some(8800),
+            &[alice_pub],   // only alice authorized
+        ).unwrap();
+        let signed = sign_descriptor(&hs.identity, unsigned, current_epoch());
+
+        // Eve tries her own secret — must get None (not error)
+        let r = PhiNode::resolve_hs_descriptor(&signed, &[eve_sec])
+            .expect("resolve should not error on unauthorized");
+        assert!(r.is_none(),
+            "unauthorized client should get None, not an error");
+    }
+
+    #[test]
+    fn resolve_authed_descriptor_tries_multiple_secrets() {
+        // Caller might have several authorized-client identities (e.g.
+        // for different hidden services). resolve_hs_descriptor tries
+        // each in turn; only one needs to match.
+        let cert = PhiCert::generate(CertBits::B256).unwrap();
+        let hs = HiddenService::new(&cert, "svc-priv");
+
+        // Three secrets — only the third is authorized
+        let unrelated_a = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let unrelated_b = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let alice_sec = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let alice_pub = *XPub::from(&alice_sec).as_bytes();
+
+        let unsigned = hs.descriptor_with_client_auth(
+            Some("intro.host"), Some(8800),
+            &[alice_pub],
+        ).unwrap();
+        let signed = sign_descriptor(&hs.identity, unsigned, current_epoch());
+
+        let resolved = PhiNode::resolve_hs_descriptor(
+            &signed, &[unrelated_a, unrelated_b, alice_sec],
+        ).expect("resolve").expect("alice authorized");
+        // Successfully recovered intro_pub
+        assert_eq!(resolved.intro_pub, *hs.intro_pub.as_bytes());
+    }
+
+    #[test]
+    fn resolve_rejects_unsigned_descriptor() {
+        // Resolve must verify signature first regardless of auth model.
+        // A descriptor with no signature must be rejected.
+        let cert = PhiCert::generate(CertBits::B256).unwrap();
+        let hs = HiddenService::new(&cert, "svc");
+        let unsigned = hs.descriptor(Some("h"), Some(1));
+        // Don't sign it — sig field stays empty
+
+        let r = PhiNode::resolve_hs_descriptor(&unsigned, &[]);
+        assert!(r.is_err(),
+            "unsigned descriptor must fail signature check");
+    }
+
+    #[test]
+    fn resolve_rejects_tampered_descriptor() {
+        let cert = PhiCert::generate(CertBits::B256).unwrap();
+        let hs = HiddenService::new(&cert, "svc");
+        let unsigned = hs.descriptor(Some("h"), Some(1));
+        let mut signed = sign_descriptor(&hs.identity, unsigned, current_epoch());
+
+        // Tamper: change intro_host. Sig was over original.
+        signed.intro_host = Some("attacker.example".into());
+
+        let r = PhiNode::resolve_hs_descriptor(&signed, &[]);
+        assert!(r.is_err(),
+            "tampered descriptor must fail signature");
     }
 }

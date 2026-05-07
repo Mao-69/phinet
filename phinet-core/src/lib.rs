@@ -36,6 +36,11 @@ pub mod error;
 
 pub use error::{Error, Result};
 
+/// Re-export x25519_dalek so downstream crates can use the same
+/// version without taking a direct dependency. Used by the daemon's
+/// `hs_auth_gen_client` control command.
+pub use x25519_dalek;
+
 /// Restrict a file to owner-only read/write on Unix (0o600). No-op
 /// on non-Unix. Best-effort: logs but doesn't fail if the chmod fails.
 pub fn secure_permissions(path: &std::path::Path) {

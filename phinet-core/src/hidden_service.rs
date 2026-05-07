@@ -7,6 +7,7 @@ use crate::{
     pow::{IntroPuzzle, IntroPuzzleSolution, PuzzleController},
     store::SiteStore,
     wire::HsDescriptor,
+    Result,
 };
 use rand::{rngs::OsRng, seq::SliceRandom, RngCore};
 use std::{
@@ -106,7 +107,52 @@ impl HiddenService {
             epoch:        0,
             sig:          String::new(),
             blinded_pub:  String::new(),
+            client_auth:  None,
         }
+    }
+
+    /// Build a client-authorized descriptor.
+    ///
+    /// The intro point fields (intro_pub, intro_host, intro_port)
+    /// are encrypted to the set of authorized clients via
+    /// `client_auth::encrypt_intro_for_clients`. The plaintext
+    /// fields are left empty in the resulting descriptor — only
+    /// authorized clients can recover them.
+    ///
+    /// `client_pubs` is the list of authorized clients' X25519
+    /// public keys (32 bytes each). The descriptor will fail to
+    /// build if this list is empty (would result in a permanently
+    /// inaccessible service).
+    ///
+    /// The returned descriptor is unsigned; pass to `sign_descriptor`
+    /// to produce a publishable copy.
+    pub fn descriptor_with_client_auth(
+        &self,
+        intro_host: Option<&str>,
+        intro_port: Option<u16>,
+        client_pubs: &[[u8; 32]],
+    ) -> Result<HsDescriptor> {
+        use crate::client_auth::{encrypt_intro_for_clients, IntroPointSecret};
+
+        let intro = IntroPointSecret {
+            intro_pub:  hex::encode(self.intro_pub.as_bytes()),
+            intro_host: intro_host.map(|s| s.to_string()),
+            intro_port,
+        };
+        let block = encrypt_intro_for_clients(&intro, client_pubs)?;
+
+        Ok(HsDescriptor {
+            hs_id:        self.hs_id.clone(),
+            name:         self.name.clone(),
+            intro_pub:    String::new(),       // hidden behind client_auth
+            intro_host:   None,
+            intro_port:   None,
+            identity_pub: String::new(),
+            epoch:        0,
+            sig:          String::new(),
+            blinded_pub:  String::new(),
+            client_auth:  Some(block),
+        })
     }
 
     pub fn issue_puzzle(&self) -> IntroPuzzle {

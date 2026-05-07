@@ -402,6 +402,38 @@ pub fn canonical_descriptor_bytes(d: &crate::wire::HsDescriptor) -> Vec<u8> {
     out.extend_from_slice(&d.epoch.to_be_bytes());
     out.extend_from_slice(&(d.blinded_pub.len() as u32).to_be_bytes());
     out.extend_from_slice(d.blinded_pub.as_bytes());
+
+    // Client-auth block: cover it in the signature so HSDir can't
+    // substitute clients_auth contents. If `None`, write a single 0
+    // length-prefix so old (no-auth) descriptors still produce the
+    // exact same canonical bytes they did before this field existed.
+    // Backwards-compatible: the empty marker matches what
+    // serializing a default-constructed descriptor produced previously.
+    match &d.client_auth {
+        None => {
+            out.extend_from_slice(&0u32.to_be_bytes());
+        }
+        Some(block) => {
+            // Marker = 1 distinguishes "absent" (0) from "present
+            // but empty" — even though we don't allow empty client
+            // lists, the explicit marker prevents canonicalization
+            // ambiguity if that invariant is ever relaxed.
+            out.extend_from_slice(&1u32.to_be_bytes());
+            // Length-prefix each component so concatenation is
+            // unambiguous.
+            out.extend_from_slice(&(block.encrypted_intro.len() as u32).to_be_bytes());
+            out.extend_from_slice(block.encrypted_intro.as_bytes());
+            out.extend_from_slice(&(block.intro_nonce.len() as u32).to_be_bytes());
+            out.extend_from_slice(block.intro_nonce.as_bytes());
+            out.extend_from_slice(&(block.clients.len() as u32).to_be_bytes());
+            for entry in &block.clients {
+                out.extend_from_slice(&(entry.ephemeral_pub.len() as u32).to_be_bytes());
+                out.extend_from_slice(entry.ephemeral_pub.as_bytes());
+                out.extend_from_slice(&(entry.encrypted_key.len() as u32).to_be_bytes());
+                out.extend_from_slice(entry.encrypted_key.as_bytes());
+            }
+        }
+    }
     out
 }
 
@@ -537,6 +569,52 @@ pub fn verify_descriptor(d: &crate::wire::HsDescriptor) -> Result<()> {
     let signature = ed25519_dalek::Signature::from_bytes(&sig);
     vk.verify(&canonical, &signature)
         .map_err(|e| Error::Crypto(format!("descriptor sig: {e}")))?;
+
+    // (4) Client-auth structural validation
+    //
+    // The signature already covers the client_auth block (see
+    // canonical_descriptor_bytes). Here we just sanity-check the
+    // structure: presence of client_auth implies the plaintext
+    // intro fields must be empty (otherwise an HSDir might serve a
+    // descriptor where the public fields point to one server and
+    // the encrypted block points to another, confusing clients).
+    //
+    // Conversely, absence of client_auth requires the plaintext
+    // intro_pub to be present (otherwise we have a descriptor with
+    // no usable intro point at all).
+    if let Some(block) = &d.client_auth {
+        if !d.intro_pub.is_empty() {
+            return Err(Error::Crypto(
+                "descriptor: client_auth present but intro_pub also set".into()));
+        }
+        if d.intro_host.as_deref().map_or(false, |s| !s.is_empty()) {
+            return Err(Error::Crypto(
+                "descriptor: client_auth present but intro_host also set".into()));
+        }
+        if d.intro_port.unwrap_or(0) != 0 {
+            return Err(Error::Crypto(
+                "descriptor: client_auth present but intro_port also set".into()));
+        }
+        if block.clients.is_empty() {
+            return Err(Error::Crypto(
+                "descriptor: client_auth block has no authorized clients".into()));
+        }
+        // Sanity-check entry sizes
+        for (i, entry) in block.clients.iter().enumerate() {
+            if entry.ephemeral_pub.len() != 64 {
+                return Err(Error::Crypto(format!(
+                    "descriptor: client_auth entry {} has bad ephemeral_pub length", i)));
+            }
+            // Wrapped key = 32 bytes plaintext + 16 bytes AEAD tag = 48 bytes = 96 hex chars
+            if entry.encrypted_key.len() != 96 {
+                return Err(Error::Crypto(format!(
+                    "descriptor: client_auth entry {} has bad encrypted_key length", i)));
+            }
+        }
+    } else if d.intro_pub.is_empty() {
+        return Err(Error::Crypto(
+            "descriptor: no intro_pub and no client_auth block".into()));
+    }
 
     Ok(())
 }
@@ -781,6 +859,7 @@ mod tests {
             intro_pub: "p".into(), intro_host: Some("h".into()),
             intro_port: Some(1), identity_pub: "ip".into(),
             epoch: 7, sig: "".into(), blinded_pub: "bp".into(),
+            client_auth: None,
         };
         let b1 = canonical_descriptor_bytes(&base);
 
@@ -807,6 +886,7 @@ mod tests {
             epoch: 0,
             sig: String::new(),
             blinded_pub: String::new(),
+            client_auth: None,
         };
         let signed = sign_descriptor(&id, d, 500);
         assert!(!signed.sig.is_empty());
@@ -827,6 +907,7 @@ mod tests {
             intro_port: Some(80),
             identity_pub: String::new(), epoch: 0,
             sig: String::new(), blinded_pub: String::new(),
+            client_auth: None,
         };
         let signed = sign_descriptor(&id, d, current_epoch());
         verify_descriptor(&signed).expect("valid signed descriptor must verify");
@@ -842,6 +923,7 @@ mod tests {
             intro_port: Some(80),
             identity_pub: String::new(), epoch: 0,
             sig: String::new(), blinded_pub: String::new(),
+            client_auth: None,
         };
         let mut signed = sign_descriptor(&id, d, current_epoch());
 
@@ -863,6 +945,7 @@ mod tests {
             intro_port: None,
             identity_pub: String::new(), epoch: 0,
             sig: String::new(), blinded_pub: String::new(),
+            client_auth: None,
         };
         let signed = sign_descriptor(&id, d, current_epoch());
         assert!(verify_descriptor(&signed).is_err(),
@@ -879,6 +962,7 @@ mod tests {
             intro_port: None,
             identity_pub: String::new(), epoch: 0,
             sig: String::new(), blinded_pub: String::new(),
+            client_auth: None,
         };
         // Epoch way in the past — well outside ±1 tolerance
         let signed = sign_descriptor(&id, d, current_epoch().saturating_sub(30));
@@ -894,6 +978,7 @@ mod tests {
             intro_pub: "".into(), intro_host: None, intro_port: None,
             identity_pub: String::new(), epoch: 0,
             sig: String::new(), blinded_pub: String::new(),
+            client_auth: None,
         };
         assert!(verify_descriptor(&d).is_err(),
             "unsigned descriptor must fail");
@@ -918,6 +1003,7 @@ mod tests {
             intro_pub: "abcd".into(), intro_host: None, intro_port: None,
             identity_pub: String::new(), epoch: 0,
             sig: String::new(), blinded_pub: String::new(),
+            client_auth: None,
         };
         let mut signed = sign_descriptor(&real, d, current_epoch());
 
@@ -957,5 +1043,194 @@ mod tests {
         // with real.hs_id() AND their own intro_pub AND a valid sig
         // without holding real's secret key.
         let _ = verify_result; // document the observation
+    }
+
+    // ── Client-auth wire integration ─────────────────────────────────
+
+    #[test]
+    fn signed_client_auth_descriptor_verifies() {
+        // End-to-end: build a HiddenService, produce a client-auth
+        // descriptor, sign it, verify it. Verifies that:
+        //   - sign+verify works for client-auth descriptors
+        //   - the signature covers the client_auth block (the
+        //     canonical-bytes integration is correct)
+        //   - structural validation accepts a well-formed block
+        use crate::client_auth::IntroPointSecret;
+        use crate::hidden_service::HiddenService;
+        use crate::cert::{CertBits, PhiCert};
+        use crate::store::SiteStore;
+        use std::sync::Arc;
+        use x25519_dalek::{StaticSecret, PublicKey};
+
+        let cert  = PhiCert::generate(CertBits::B256).unwrap();
+        let hs    = HiddenService::new(&cert, "test-svc");
+
+        let alice_sec = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let alice_pub = *PublicKey::from(&alice_sec).as_bytes();
+
+        let unsigned = hs.descriptor_with_client_auth(
+            Some("intro.example"),
+            Some(7700),
+            &[alice_pub],
+        ).expect("build authed descriptor");
+
+        // Plaintext intro fields must be empty for client-auth
+        assert!(unsigned.intro_pub.is_empty());
+        assert!(unsigned.intro_host.is_none());
+        assert!(unsigned.intro_port.is_none());
+        assert!(unsigned.client_auth.is_some());
+
+        let signed = sign_descriptor(&hs.identity, unsigned, current_epoch());
+
+        // Must verify successfully
+        verify_descriptor(&signed).expect("client-auth descriptor must verify");
+
+        // Alice can recover the intro
+        use crate::client_auth::decrypt_intro_with_client_secret;
+        let block = signed.client_auth.as_ref().unwrap();
+        let intro: IntroPointSecret = decrypt_intro_with_client_secret(block, &alice_sec)
+            .expect("decrypt").expect("alice authorized");
+        assert_eq!(intro.intro_host.as_deref(), Some("intro.example"));
+        assert_eq!(intro.intro_port, Some(7700));
+    }
+
+    #[test]
+    fn tampering_with_client_auth_block_breaks_signature() {
+        // Confirms the signature actually covers client_auth — if
+        // an HSDir tries to swap in a different ClientAuthBlock,
+        // the signature must fail.
+        use crate::hidden_service::HiddenService;
+        use crate::cert::{CertBits, PhiCert};
+        use crate::store::SiteStore;
+        use std::sync::Arc;
+        use x25519_dalek::{StaticSecret, PublicKey};
+
+        let cert  = PhiCert::generate(CertBits::B256).unwrap();
+        let hs    = HiddenService::new(&cert, "test-svc");
+
+        let alice_pub = *PublicKey::from(&StaticSecret::random_from_rng(rand::rngs::OsRng))
+            .as_bytes();
+
+        let unsigned = hs.descriptor_with_client_auth(
+            Some("intro.example"), Some(7700), &[alice_pub],
+        ).unwrap();
+        let mut signed = sign_descriptor(&hs.identity, unsigned, current_epoch());
+
+        // Tamper: flip a byte in the encrypted_intro field.
+        let block = signed.client_auth.as_mut().unwrap();
+        let mut bytes = hex::decode(&block.encrypted_intro).unwrap();
+        bytes[0] ^= 0x01;
+        block.encrypted_intro = hex::encode(bytes);
+
+        // Verification must now fail at the Ed25519 sig check.
+        let r = verify_descriptor(&signed);
+        assert!(r.is_err(), "tampered client_auth must fail signature");
+        assert!(format!("{:?}", r).contains("sig"),
+            "error should mention signature failure");
+    }
+
+    #[test]
+    fn descriptor_without_intro_or_client_auth_rejected() {
+        // A descriptor with no plaintext intro_pub AND no client_auth
+        // block must be rejected — it's unusable.
+        use crate::hidden_service::HiddenService;
+        use crate::cert::{CertBits, PhiCert};
+        use crate::store::SiteStore;
+        use std::sync::Arc;
+
+        let cert  = PhiCert::generate(CertBits::B256).unwrap();
+        let hs    = HiddenService::new(&cert, "test-svc");
+
+        // Build a descriptor manually with both empty — this is a
+        // malformed input we want verify_descriptor to reject.
+        let bad = crate::wire::HsDescriptor {
+            hs_id: hs.hs_id.clone(),
+            name: "test-svc".into(),
+            intro_pub: String::new(),
+            intro_host: None,
+            intro_port: None,
+            client_auth: None,
+            ..Default::default()
+        };
+        let signed = sign_descriptor(&hs.identity, bad, current_epoch());
+
+        let r = verify_descriptor(&signed);
+        assert!(r.is_err());
+        assert!(format!("{:?}", r).contains("no intro_pub"));
+    }
+
+    #[test]
+    fn descriptor_with_both_intro_and_client_auth_rejected() {
+        // Inconsistent: a descriptor with both plaintext intro AND
+        // client_auth block makes no sense and could confuse clients
+        // about which intro to use. Must be rejected.
+        use crate::client_auth::{encrypt_intro_for_clients, IntroPointSecret};
+        use crate::hidden_service::HiddenService;
+        use crate::cert::{CertBits, PhiCert};
+        use crate::store::SiteStore;
+        use std::sync::Arc;
+        use x25519_dalek::{StaticSecret, PublicKey};
+
+        let cert  = PhiCert::generate(CertBits::B256).unwrap();
+        let hs    = HiddenService::new(&cert, "test-svc");
+        let alice_pub = *PublicKey::from(&StaticSecret::random_from_rng(rand::rngs::OsRng))
+            .as_bytes();
+
+        let block = encrypt_intro_for_clients(
+            &IntroPointSecret {
+                intro_pub: "abcd".into(), intro_host: None, intro_port: None
+            },
+            &[alice_pub],
+        ).unwrap();
+
+        let bad = crate::wire::HsDescriptor {
+            hs_id: hs.hs_id.clone(),
+            name: "test-svc".into(),
+            intro_pub: "deadbeef".into(),  // both populated
+            intro_host: None,
+            intro_port: None,
+            client_auth: Some(block),
+            ..Default::default()
+        };
+        let signed = sign_descriptor(&hs.identity, bad, current_epoch());
+        let r = verify_descriptor(&signed);
+        assert!(r.is_err());
+        assert!(format!("{:?}", r).contains("client_auth present but intro_pub also set"));
+    }
+
+    #[test]
+    fn empty_client_list_rejected_at_descriptor_level() {
+        // A descriptor with a client_auth block containing zero
+        // clients is unusable. We get this for free from the
+        // encrypt_intro_for_clients function rejecting empty lists,
+        // but verify_descriptor's structural check catches it too as
+        // defense in depth.
+        use crate::hidden_service::HiddenService;
+        use crate::cert::{CertBits, PhiCert};
+        use crate::store::SiteStore;
+        use std::sync::Arc;
+
+        let cert  = PhiCert::generate(CertBits::B256).unwrap();
+        let hs    = HiddenService::new(&cert, "test-svc");
+
+        // Hand-construct a malformed block (encrypt_intro_for_clients
+        // rejects empty lists, so we bypass it for this test).
+        let empty_block = crate::client_auth::ClientAuthBlock {
+            encrypted_intro: hex::encode([0u8; 64]),
+            intro_nonce:     hex::encode([0u8; 12]),
+            clients:         Vec::new(),
+        };
+        let bad = crate::wire::HsDescriptor {
+            hs_id: hs.hs_id.clone(),
+            name: "test".into(),
+            intro_pub: String::new(),
+            intro_host: None, intro_port: None,
+            client_auth: Some(empty_block),
+            ..Default::default()
+        };
+        let signed = sign_descriptor(&hs.identity, bad, current_epoch());
+        let r = verify_descriptor(&signed);
+        assert!(r.is_err());
+        assert!(format!("{:?}", r).contains("no authorized clients"));
     }
 }

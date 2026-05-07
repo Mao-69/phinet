@@ -233,6 +233,7 @@ mod tests {
             epoch: 0,
             sig: String::new(),
             blinded_pub: String::new(),
+            client_auth: None,
         };
         s.put_hs(&d);
         let got = s.get_hs("ab12345678901234abcd").unwrap();
