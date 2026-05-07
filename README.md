@@ -1,7 +1,13 @@
 # ΦNET — Anonymous Overlay Network
 
-A Tor-inspired anonymous network rooted in number theory. Identity = a valid ΦNET
-certificate (untouchable × totient × prime). No accounts, no IP identity, no trust.
+A Tor-inspired anonymous network rooted in number theory.
+
+<img width="1059" height="687" alt="578398323-12ae45da-9ac1-49c8-bd33-bc61366b3e7d" src="https://github.com/user-attachments/assets/ec843bed-880f-4eef-82d1-7d114c449ac3" />
+
+<img width="1059" height="687" alt="578398405-64537e4a-27f1-4e7b-a0ab-c192fc060282" src="https://github.com/user-attachments/assets/79872da1-fd4d-47fb-b8ff-a4d31937a5f1" />
+
+<img width="1059" height="687" alt="578398490-efdbf237-748b-41cc-9d2c-42e7902a8ea2" src="https://github.com/user-attachments/assets/daba591f-4ec4-4909-917b-2f554b9a62be" />
+
 
 ## Architecture
 
