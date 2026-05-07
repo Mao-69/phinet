@@ -1,4 +1,4 @@
-# ΦNET — Anonymous Overlay Network
+# ΦNET — Overlay Network
 
 A Tor-inspired anonymous network rooted in number theory.
 
