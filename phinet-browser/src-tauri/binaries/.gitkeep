@@ -1,0 +1,3 @@
+# Tauri sidecar binaries go here, named phinet-daemon-<target-triple>[.exe].
+# Populate with ./sync-sidecar.sh <path-to-built-phinet-daemon> before building.
+# These are large platform binaries — not committed to git.
